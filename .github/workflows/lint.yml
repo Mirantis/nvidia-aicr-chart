@@ -1,0 +1,29 @@
+name: Lint
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: helm lint
+        run: helm lint .
+
+      # Renders every conditional path and asserts on rendered VALUES.
+      # Shared with the release workflow so a tag cannot publish a chart whose
+      # branches were never rendered.
+      - name: Verify render
+        run: ./hack/verify-render.sh .
+
+      - name: Package
+        run: helm package .

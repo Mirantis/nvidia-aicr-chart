@@ -1,0 +1,116 @@
+# AICR recipe inputs. An EMPTY value omits that criteria flag entirely, letting
+# aicr use its detected/any value — the right choice for dimensions the target
+# recipe overlays don't define (many overlays are os- or platform-agnostic).
+accelerator: a100      # h100 | h200 | gb200 | gb300 | b200 | a100 | l40 | l40s | rtx-pro-6000
+# intent must stay empty with service=any: at aicr v0.18.0 a stated intent
+# requires a service/os combination that declares it (aks/bcm/eks/lke/ocp/
+# gke+cos/oke) — `service: any` overlays declare service+accelerator only,
+# so `intent: training` fails resolution outright. Set intent only together
+# with a service that provides it (e.g. service: kind, intent: training).
+intent: ""             # "" (omit) | training | inference
+os: ""                 # "" (omit) | ubuntu | rhel | cos | amazonlinux | ol | talos
+platform: ""           # "" (omit) | kubeflow | dynamo | nim | runai | slurm
+# Managed-service overlay. "any" (aliases: self-managed, self, vanilla) matches
+# base+accelerator overlays without requiring a substrate overlay - the right
+# value for self-managed clusters such as k0rdent-provisioned k0s. Explicit
+# values: aks | bcm | eks | gke | kind | lke | metal3 | ocp | oke.
+service: any
+
+# AICR binary
+aicrVersion: v0.18.0   # https://github.com/NVIDIA/aicr/releases
+aicrArch: amd64        # amd64 | arm64
+# Optional strict pin: sha256 of the release tarball, keyed by architecture
+# (from aicr_checksums.txt). When the entry for the selected aicrArch is
+# non-empty, the Job verifies against it in addition to the release's
+# checksums file, anchoring trust in reviewed chart values instead of release
+# assets. An empty entry skips only the strict pin — verification against the
+# release checksums file always runs and is always fail-closed.
+# Keyed by arch so that switching aicrArch cannot silently check a tarball
+# against the wrong architecture's hash. Update on every aicrVersion bump.
+aicrSha256:
+  amd64: "6a498b8ce0dcb0e28095de35cdae583391ad567f3922aae6657c851cc76275ee"  # v0.18.0 linux_amd64
+  arm64: ""
+
+# Install behavior
+storageClass: ""       # if non-empty, passed as --storage-class to `aicr bundle`
+recipeFlags: ""        # extra flags passed to `aicr recipe` (e.g. "--criteria-strict")
+# Extra flags passed to `aicr bundle`. Notable org-facing flags:
+#   --accelerated-node-toleration key=value:effect   tolerate tainted GPU nodes
+#   --system-node-selector key=value                 pin system components
+#   --set component:path=value                       per-component overrides
+#   --vendor-charts                                  pull chart bytes into bundle (air-gap prep)
+bundleFlags: ""
+
+# Cluster environment profile. These toggles inject the component overrides a
+# cluster needs before the NVIDIA stack can converge. They are applied BEFORE
+# bundleFlags, so anything you set there wins.
+environment:
+  # k0s runs its own containerd (socket /run/k0s/containerd.sock, drop-ins in
+  # /etc/k0s/containerd.d). Without this the container-toolkit configures the
+  # DEFAULT containerd, reports success, and GPU pods then fail with
+  # `no runtime for "nvidia" is configured`. Set true on k0s clusters,
+  # including k0rdent-provisioned ones.
+  k0sContainerd: false
+  # Nodes already carry an NVIDIA driver (host package, DKMS, or baked image):
+  # the GPU operator must not install its own, and the DRA driver must read the
+  # host root. aicr's driver-ownership coherence check requires both together,
+  # so this single toggle sets both.
+  preinstalledDriver: false
+
+deployFlags: "--best-effort --no-wait"   # deploy.sh flags: --best-effort | --no-wait | --retries N
+runtimeImage: alpine/k8s:1.34.0          # base image (must include bash, curl, kubectl + helm)
+
+# Optional AICR --data extension pack (runtime catalog/criteria/validator
+# overlays — see aicr docs/integrator/data-extension.md). OCI artifact
+# reference WITHOUT a scheme, e.g. "ghcr.io/myorg/my-aicr-pack:1.0.0".
+# When set, an initContainer pulls it and every aicr invocation gets --data.
+dataPack: ""
+orasImage: ghcr.io/oras-project/oras:v1.2.0   # initContainer image for the pack pull
+
+# Optional post-install validation (aicr validate). Disabled by default: on
+# GPU-less clusters (kind included) the deployment phase legitimately fails
+# while GPU pods sit Pending. When enabling, drop --no-wait from deployFlags
+# so deploy.sh waits for convergence before the verdict is taken.
+validate:
+  enabled: false
+  phases: [deployment]          # deployment | performance | conformance
+  # A failed validation is captured to the result ConfigMap either way; by
+  # default the Job still succeeds (validation is informative). Set true to
+  # make a failed validation fail the Job.
+  failOnError: false
+  # The CTRF verdict is written here (create-or-update) whether validation
+  # passes or fails — aicr's own per-phase CTRF ConfigMaps are removed at its
+  # run cleanup, so the chart owns durable capture.
+  resultConfigMap: aicr-validate-result
+  emitEvidence: false           # also capture the --emit-attestation bundle
+  evidenceConfigMap: aicr-evidence-bundle
+
+# Job
+job:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 3600
+  # Hard cap on Job runtime. Sized for real GPU clusters when deployFlags
+  # drops --no-wait: per-component helm timeout is 10m with retries, the DRA
+  # post-install wait is 15m regardless of --no-wait, and GPU operator
+  # operand rollout takes 10-20 min on fresh nodes. (kind install: ~6-10 min.)
+  activeDeadlineSeconds: 10800
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "2048Mi"
+  # Scheduling for the INSTALLER pod itself. Distinct from the tolerations aicr
+  # injects into the components it deploys (bundleFlags
+  # --accelerated-node-toleration): on a cluster whose only workers are tainted
+  # GPU nodes, the Job needs its own toleration or it never schedules and the
+  # install silently burns activeDeadlineSeconds before failing.
+  nodeSelector: {}
+  tolerations: []
+  #  - key: nvidia.com/gpu
+  #    operator: Equal
+  #    value: present
+  #    effect: NoSchedule
+  affinity: {}
+  priorityClassName: ""

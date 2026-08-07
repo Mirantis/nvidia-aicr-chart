@@ -1,0 +1,88 @@
+name: Release
+
+# Publish a chart release: `git tag v0.1.1 && git push --tags`.
+#
+# workflow_dispatch is accepted only when run against a tag ref — dispatching
+# from a branch is rejected, so a release can never be cut from a moving branch
+# and overwrite a published version.
+#
+# First run only: the package is created private. Flip it to public at
+# https://github.com/orgs/<org>/packages/container/charts%2Fnvidia-aicr/settings
+# or consumers (including k0rdent catalog CI) cannot pull it.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      # Unconditional: a skipped guard on a non-tag ref would still package and
+      # push, overwriting the published version with whatever is on that ref.
+      - name: Resolve version and verify it matches the tag
+        id: v
+        run: |
+          CHART="$(helm show chart . | awk '/^version:/ {print $2}')"
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              TAG="${GITHUB_REF_NAME#v}"
+              if [ "$TAG" != "$CHART" ]; then
+                echo "::error::tag v${TAG} does not match Chart.yaml version ${CHART}"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::release must run from a vN.N.N tag (got ${GITHUB_REF})"
+              exit 1
+              ;;
+          esac
+          # ghcr rejects uppercase repository paths; org names are not
+          # guaranteed lowercase (e.g. "Mirantis").
+          OWNER="$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')"
+          echo "version=${CHART}"                     >> "$GITHUB_OUTPUT"
+          echo "registry=oci://ghcr.io/${OWNER}/charts" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${CHART} to oci://ghcr.io/${OWNER}/charts"
+
+      - name: helm lint
+        run: helm lint .
+
+      - name: Verify render
+        run: ./hack/verify-render.sh .
+
+      - name: Package
+        id: package
+        run: |
+          helm package . --destination ./dist
+          echo "file=$(ls ./dist/*.tgz)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      # Chart versions are immutable by contract: the k0rdent catalog pins an
+      # exact version, so republishing it would swap chart bytes underneath a
+      # consumer with no signal. Bump Chart.yaml instead.
+      - name: Refuse to overwrite a published version
+        run: |
+          CHART_NAME="$(helm show chart . | awk '/^name:/ {print $2}')"
+          if helm show chart "${{ steps.v.outputs.registry }}/${CHART_NAME}" \
+               --version "${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::${CHART_NAME} ${{ steps.v.outputs.version }} is already published — bump the chart version"
+            exit 1
+          fi
+          echo "version ${{ steps.v.outputs.version }} is unpublished; proceeding"
+
+      - name: Push chart
+        run: helm push "${{ steps.package.outputs.file }}" "${{ steps.v.outputs.registry }}"

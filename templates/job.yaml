@@ -1,0 +1,304 @@
+{{- if kindIs "string" .Values.aicrSha256 }}
+{{- fail "aicrSha256 is now a per-architecture map, e.g. aicrSha256: { amd64: \"<sha>\", arm64: \"<sha>\" }. Move your value under the key matching aicrArch." }}
+{{- end }}
+{{- /* compact drops empty entries: `--set validate.phases={}` yields a
+       single-element list containing "", which is truthy but produces no
+       --phase flags, making aicr run every phase including performance. */}}
+{{- $phases := compact (.Values.validate.phases | default list) }}
+{{- if and .Values.validate.enabled (not $phases) }}
+{{- fail "validate.enabled requires at least one non-empty entry in validate.phases (an empty list would make aicr run ALL phases, including performance)" }}
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Revision-suffixed: Job specs are immutable, so a helm upgrade with changed
+  # values creates a fresh Job instead of erroring. Finished Jobs are reaped by
+  # ttlSecondsAfterFinished.
+  #
+  # Caveat: ttlSecondsAfterFinished only applies once a Job has FINISHED.
+  # Upgrading while an install is still running makes Helm delete the previous
+  # revision's Job (it is absent from the new manifest), which SIGKILLs
+  # deploy.sh mid-run and can leave downstream releases in
+  # pending-install/pending-upgrade. Let an install finish before upgrading.
+  name: {{ .Release.Name }}-install-{{ .Release.Revision }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: nvidia-aicr
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  backoffLimit: {{ .Values.job.backoffLimit }}
+  activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nvidia-aicr
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-installer
+      restartPolicy: Never
+      {{- with .Values.job.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.job.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.job.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.job.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      # The ServiceAccount is bound to cluster-admin (AICR installs CRDs,
+      # namespaces, and RBAC), so the pod itself runs locked down: nonroot,
+      # read-only root filesystem, all work under an emptyDir at /tmp.
+      # UID 65532 matches upstream's own manifests (ghcr.io/nvidia/aicr* run
+      # as ko's nonroot user).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      {{- if .Values.dataPack }}
+      initContainers:
+        # Pull the AICR --data extension pack (OCI artifact) into the shared
+        # volume. Public artifacts only in this chart version.
+        - name: data-pack
+          image: {{ .Values.orasImage | quote }}
+          args: ["pull", {{ .Values.dataPack | quote }}, "-o", "/data/pack"]
+          env:
+            - name: HOME          # oras writes config under $HOME; rootfs is read-only
+              value: /data/pack
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: pack
+              mountPath: /data/pack
+      {{- end }}
+      containers:
+        - name: aicr
+          image: {{ .Values.runtimeImage | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.job.resources | nindent 12 }}
+          volumeMounts:
+            - name: work
+              mountPath: /tmp
+            {{- if .Values.dataPack }}
+            - name: pack
+              mountPath: /data/pack
+              readOnly: true
+            {{- end }}
+          env:
+            # helm/kubectl/aicr write caches and config under $HOME; point it
+            # at the writable emptyDir since the root filesystem is read-only.
+            - name: HOME
+              value: /tmp
+            - name: AICR_VERSION
+              value: {{ .Values.aicrVersion | quote }}
+            - name: AICR_ARCH
+              value: {{ .Values.aicrArch | quote }}
+            {{- /* Arch-keyed so switching aicrArch can never check a tarball
+                   against another architecture's hash. Empty => strict pin
+                   skipped; the checksums-file verification still runs. */}}
+            - name: AICR_SHA256
+              value: {{ get (.Values.aicrSha256 | default dict) .Values.aicrArch | default "" | quote }}
+            - name: ACCELERATOR
+              value: {{ .Values.accelerator | quote }}
+            - name: INTENT
+              value: {{ .Values.intent | quote }}
+            - name: OS
+              value: {{ .Values.os | quote }}
+            - name: PLATFORM
+              value: {{ .Values.platform | quote }}
+            - name: SERVICE
+              value: {{ .Values.service | quote }}
+            - name: STORAGE_CLASS
+              value: {{ .Values.storageClass | quote }}
+            - name: RECIPE_FLAGS
+              value: {{ .Values.recipeFlags | quote }}
+            - name: BUNDLE_FLAGS
+              value: {{ .Values.bundleFlags | quote }}
+            {{- /* Booleans render through Helm truthiness rather than `| quote`
+                   so a value like `1` cannot be truthy to the template and false
+                   to the script's `= "true"` test — which would silently skip
+                   the profile while the Job still reported success. */}}
+            - name: ENV_K0S_CONTAINERD
+              value: {{ if .Values.environment.k0sContainerd }}"true"{{ else }}"false"{{ end }}
+            - name: ENV_PREINSTALLED_DRIVER
+              value: {{ if .Values.environment.preinstalledDriver }}"true"{{ else }}"false"{{ end }}
+            - name: DEPLOY_FLAGS
+              value: {{ .Values.deployFlags | quote }}
+            - name: DATA_PACK
+              value: {{ .Values.dataPack | quote }}
+            - name: VALIDATE_ENABLED
+              value: {{ if .Values.validate.enabled }}"true"{{ else }}"false"{{ end }}
+            - name: VALIDATE_PHASES
+              value: {{ join " " $phases | quote }}
+            - name: VALIDATE_FAIL_ON_ERROR
+              value: {{ if .Values.validate.failOnError }}"true"{{ else }}"false"{{ end }}
+            - name: RESULT_CM
+              value: {{ .Values.validate.resultConfigMap | quote }}
+            - name: EMIT_EVIDENCE
+              value: {{ if .Values.validate.emitEvidence }}"true"{{ else }}"false"{{ end }}
+            - name: EVIDENCE_CM
+              value: {{ .Values.validate.evidenceConfigMap | quote }}
+            - name: RESULT_NS
+              value: {{ .Release.Namespace | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+              echo "=== AICR install Job starting ==="
+              echo "Version=${AICR_VERSION}  Arch=${AICR_ARCH}"
+              echo "Recipe inputs: service=${SERVICE} accelerator=${ACCELERATOR} os=${OS} intent=${INTENT} platform=${PLATFORM}"
+
+              cd /tmp
+              AICR_VERSION="v${AICR_VERSION#v}"   # tolerate an un-prefixed version value
+              TARBALL="aicr_${AICR_VERSION#v}_linux_${AICR_ARCH}.tar.gz"
+              BASE_URL="https://github.com/NVIDIA/aicr/releases/download/${AICR_VERSION}"
+              echo "=== Downloading aicr ${AICR_VERSION} ==="
+              echo "URL: ${BASE_URL}/${TARBALL}"
+              curl -fsSL -o "${TARBALL}" "${BASE_URL}/${TARBALL}"
+              curl -fsSL -o aicr_checksums.txt "${BASE_URL}/aicr_checksums.txt"
+
+              echo "=== Verifying checksum ==="
+              # Fail closed: grep finds the tarball's line or the pipeline dies.
+              grep " ${TARBALL}\$" aicr_checksums.txt | sha256sum -c -
+              # Optional strict pin: anchors trust in reviewed chart values
+              # rather than release assets (set aicrSha256.<arch>).
+              if [ -n "${AICR_SHA256}" ]; then
+                echo "${AICR_SHA256}  ${TARBALL}" | sha256sum -c -
+              fi
+
+              tar -xzf "${TARBALL}"
+              chmod +x ./aicr
+              ./aicr --version
+
+              # --data pack (pulled by the initContainer when configured)
+              DATA_ARGS=()
+              if [ -n "${DATA_PACK}" ]; then
+                DATA_ARGS+=(--data /data/pack)
+                echo "Using --data pack: ${DATA_PACK}"
+              fi
+
+              echo "=== Generating recipe ==="
+              # Empty criteria value => flag omitted: aicr then uses its
+              # detected/any value for that dimension. Recipe overlays rarely
+              # define every dimension (e.g. the kind overlays are
+              # os-agnostic), and a flag naming a dimension the matching
+              # overlays don't provide fails resolution outright.
+              RECIPE_ARGS=(--output ./recipe.yaml)
+              [ -n "${SERVICE}" ]     && RECIPE_ARGS+=(--service "${SERVICE}")
+              [ -n "${ACCELERATOR}" ] && RECIPE_ARGS+=(--accelerator "${ACCELERATOR}")
+              [ -n "${OS}" ]          && RECIPE_ARGS+=(--os "${OS}")
+              [ -n "${INTENT}" ]      && RECIPE_ARGS+=(--intent "${INTENT}")
+              [ -n "${PLATFORM}" ]    && RECIPE_ARGS+=(--platform "${PLATFORM}")
+              # RECIPE_FLAGS/BUNDLE_FLAGS/DEPLOY_FLAGS are intentionally
+              # word-split: freeform passthrough for extra CLI flags.
+              ./aicr recipe "${RECIPE_ARGS[@]}" "${DATA_ARGS[@]}" ${RECIPE_FLAGS}
+              echo "Recipe size: $(wc -l < ./recipe.yaml) lines"
+
+              echo "=== Generating bundle ==="
+              BUNDLE_ARGS=(--recipe ./recipe.yaml --deployer helm --output ./bundles)
+              if [ -n "${STORAGE_CLASS}" ]; then
+                BUNDLE_ARGS+=(--storage-class "${STORAGE_CLASS}")
+              fi
+              # Environment profile (values.environment.*), applied before
+              # BUNDLE_FLAGS so operator-supplied flags win. Note --set is
+              # scalar-only in aicr, hence --set-json for the toolkit env list.
+              PROFILE_ARGS=()
+              if [ "${ENV_PREINSTALLED_DRIVER}" = "true" ]; then
+                PROFILE_ARGS+=(--set gpuoperator:driver.enabled=false)
+                PROFILE_ARGS+=(--set dradriver:nvidiaDriverRoot=/)
+                echo "profile: preinstalled driver (gpu-operator driver off, DRA root /)"
+              fi
+              if [ "${ENV_K0S_CONTAINERD}" = "true" ]; then
+                PROFILE_ARGS+=(--set-json 'gpuoperator:toolkit.env=[{"name":"CONTAINERD_CONFIG","value":"/etc/k0s/containerd.d/nvidia.toml"},{"name":"CONTAINERD_SOCKET","value":"/run/k0s/containerd.sock"},{"name":"CONTAINERD_RUNTIME_CLASS","value":"nvidia"}]')
+                echo "profile: k0s containerd (toolkit -> /run/k0s/containerd.sock)"
+              fi
+              ./aicr bundle "${BUNDLE_ARGS[@]}" "${DATA_ARGS[@]}" "${PROFILE_ARGS[@]}" ${BUNDLE_FLAGS}
+              ls -la ./bundles/
+
+              echo "=== Running deploy.sh ==="
+              # deploy.sh at aicr v0.18.0 does NOT exit non-zero on component
+              # failures (with or without --best-effort) — it only reports
+              # them. Detect the failure line ourselves so a partial install
+              # can never masquerade as success: with --best-effort we warn
+              # and continue (that is what the operator asked for); without
+              # it we fail the Job.
+              ( cd ./bundles && bash ./deploy.sh ${DEPLOY_FLAGS} ) 2>&1 | tee ./deploy.log
+              if grep -q "Deployment completed with failures" ./deploy.log; then
+                echo "WARN: deploy.sh reported component failures (see log above)"
+                case " ${DEPLOY_FLAGS} " in
+                  *" --best-effort "*) echo "--best-effort set: continuing past component failures" ;;
+                  *) echo "=== AICR install FAILED (component failures without --best-effort) ==="; exit 1 ;;
+                esac
+              fi
+              echo "=== AICR install complete ==="
+
+              if [ "${VALIDATE_ENABLED}" = "true" ]; then
+                cd /tmp
+                echo "=== Validating (phases: ${VALIDATE_PHASES}) ==="
+                PHASE_ARGS=()
+                for p in ${VALIDATE_PHASES}; do PHASE_ARGS+=(--phase "$p"); done
+                EVIDENCE_ARGS=()
+                if [ "${EMIT_EVIDENCE}" = "true" ]; then
+                  EVIDENCE_ARGS+=(--emit-attestation ./evidence)
+                fi
+                rc=0
+                ./aicr validate --recipe ./recipe.yaml "${PHASE_ARGS[@]}" \
+                  "${DATA_ARGS[@]}" "${EVIDENCE_ARGS[@]}" \
+                  --output ./ctrf.json || rc=$?
+                echo "aicr validate exit=${rc}"
+
+                # Capture the verdict UNCONDITIONALLY (pass or fail): aicr's
+                # own per-phase CTRF ConfigMaps are removed at its run cleanup.
+                if [ -f ./ctrf.json ]; then
+                  # --server-side: client-side apply stores the full object in
+                  # the last-applied annotation, capping payloads at ~256KiB.
+                  kubectl create configmap "${RESULT_CM}" -n "${RESULT_NS}" \
+                    --from-file=ctrf.json=./ctrf.json \
+                    --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+                  echo "CTRF verdict written to configmap ${RESULT_NS}/${RESULT_CM}"
+                else
+                  echo "WARN: validate produced no ctrf.json (exit=${rc})"
+                fi
+                if [ "${EMIT_EVIDENCE}" = "true" ] && [ -d ./evidence ]; then
+                  tar czf ./evidence.tgz -C ./evidence .
+                  SIZE=$(wc -c < ./evidence.tgz)
+                  if [ "${SIZE}" -lt 921600 ]; then
+                    kubectl create configmap "${EVIDENCE_CM}" -n "${RESULT_NS}" \
+                      --from-file=evidence.tgz=./evidence.tgz \
+                      --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+                    echo "Evidence bundle (${SIZE} bytes) written to configmap ${RESULT_NS}/${EVIDENCE_CM}"
+                  else
+                    echo "WARN: evidence bundle ${SIZE} bytes exceeds the ConfigMap budget; not stored"
+                  fi
+                fi
+                if [ "${rc}" -ne 0 ] && [ "${VALIDATE_FAIL_ON_ERROR}" = "true" ]; then
+                  echo "=== Validation FAILED (exit ${rc}) ==="
+                  exit "${rc}"
+                fi
+              fi
+              echo "=== AICR Job complete ==="
+      volumes:
+        - name: work
+          emptyDir: {}
+        {{- if .Values.dataPack }}
+        - name: pack
+          emptyDir: {}
+        {{- end }}
