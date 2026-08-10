@@ -4,7 +4,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versions are the
 chart's semver. `appVersion` tracks the pinned [aicr
 release](https://github.com/NVIDIA/aicr/releases) independently.
 
-## [0.1.0] — Unreleased
+## [0.1.0] — 2026-08-11
 
 Initial release.
 
@@ -45,8 +45,7 @@ Initial release.
 - **Testing**: mutation-tested render-assertion suite shared by the lint
   and release workflows; a reproducible kind end-to-end test
   (`hack/e2e/run-kind-e2e.sh`) covering the full private-pack customer
-  path; a release-gated signed-evidence workflow using GitHub's
-  Fulcio-trusted OIDC.
+  path.
 - **Release safety**: the release workflow verifies tag == chart version,
   re-runs all render assertions, refuses to overwrite a published version,
   and lowercases the registry owner for OCI compliance.

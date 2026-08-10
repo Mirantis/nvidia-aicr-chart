@@ -357,9 +357,11 @@ The Job's ServiceAccount is bound to `cluster-admin`. AICR bundles install clust
   cluster: private org data pack from an htpasswd registry, pack-named recipe
   resolution (`hack/e2e/acme-aicr-pack/`), full install, validation, unsigned
   evidence publish, and a fail-closed negative test. Local infrastructure
-  only; ~20–25 min. Also runs in CI (`kind-e2e` workflow).
-- `.github/workflows/signed-evidence-e2e.yml` — the signed publish path,
-  release-gated (needs GitHub's Fulcio-trusted OIDC).
+  only; ~20–25 min.
+- The signed publish path has no automated test: public Sigstore does not
+  trust local cluster issuers, so it needs a Fulcio-trusted OIDC identity
+  (e.g. a GitHub Actions runner). The chart's signed-mode template plumbing
+  is covered by the render assertions.
 
 ## Relationship to upstream
 

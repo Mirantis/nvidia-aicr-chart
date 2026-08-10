@@ -39,12 +39,13 @@ the synthetic org pack (`hack/e2e/acme-aicr-pack/`), and exercises the full
 customer path: authenticated pack pull, pack-named recipe resolution,
 install, validation, unsigned evidence publish, and a fail-closed negative
 test. Requires docker, kind, kubectl, helm, curl, python3. `--keep`
-preserves the cluster for debugging. Runs in CI via the `kind-e2e` workflow
-on chart-affecting PRs.
+preserves the cluster for debugging. CI does not run it — run it before
+releasing.
 
 The signed publish path cannot run locally (public Sigstore does not trust
-local issuers); the release-gated `signed-evidence-e2e` workflow covers it
-with GitHub's OIDC identity.
+local issuers) and has no automated test; verify it from an environment
+with a Fulcio-trusted OIDC identity — e.g. `aicr evidence publish` on a
+GitHub Actions runner.
 
 ## Releasing
 

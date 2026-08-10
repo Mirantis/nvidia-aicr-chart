@@ -16,14 +16,11 @@ dataPack: "registry.registry.svc:5000/acme-aicr-pack:1.0.0"
 dataPackSecret: "acme-registry-cred"
 dataPackPlainHTTP: true
 
+# Validation is deliberately OFF in this scenario. After a --no-wait install of
+# the full stack a small CI node is ~99% CPU-requested, so aicr's snapshot-agent
+# and validator Jobs are UNSCHEDULABLE and validation times out regardless of
+# --timeout (observed on a 4-vCPU runner: cpu 3975m/99%, agent Pending, exit 8).
+# The validation and publish paths are covered by the "validate" scenario
+# (values-assert-only.yaml) on an idle cluster instead.
 validate:
-  enabled: true
-  phases: [deployment]
-  emitEvidence: true
-  publish:
-    enabled: true
-    mode: unsigned                 # signed needs a Fulcio-trusted issuer; see
-                                   # .github/workflows/signed-evidence-e2e.yml
-    ref: registry.registry.svc:5000/aicr-evidence
-    registrySecret: "acme-registry-cred"
-    plainHTTP: true
+  enabled: false

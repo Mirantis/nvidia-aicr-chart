@@ -1,0 +1,43 @@
+# Values for the "validate" e2e scenario — assert-only on an IDLE cluster.
+#
+# Why a separate scenario: aicr validate deploys a snapshot agent Job and
+# validator Jobs into the cluster. Right after a --no-wait install of the full
+# stack, a small CI node is ~99% CPU-requested and those pods are
+# UNSCHEDULABLE — validation times out no matter how long you wait (observed on
+# a 4-vCPU GitHub runner: cpu 3975m/99% requested, agent pod Pending, exit 8).
+#
+# deploy.enabled: false gives validation a cluster with room: the pack is still
+# pulled and the recipe still resolved (the contract), so the capture and
+# publish mechanics are exercised for real. Validators legitimately report
+# failures here (no components installed) — that IS the assertion working, and
+# failOnError stays false so the Job still completes.
+deploy:
+  enabled: false
+
+service: acme
+accelerator: h100
+intent: training
+
+dataPack: "registry.registry.svc:5000/acme-aicr-pack:1.0.0"
+dataPackSecret: "acme-registry-cred"
+dataPackPlainHTTP: true
+
+# Idle node: the default 5m Job wait is adequate, but validators pull images
+# and run sequentially — 10m is honest headroom, not the 20m of false hope a
+# saturated node needed.
+validateFlags: "--timeout 10m"
+
+validate:
+  enabled: true
+  phases: [deployment]
+  emitEvidence: true
+  publish:
+    enabled: true
+    mode: unsigned
+    ref: registry.registry.svc:5000/aicr-evidence
+    registrySecret: "acme-registry-cred"
+    # REQUIRED for this lab registry: without it aicr speaks HTTPS to a
+    # plain-HTTP registry, the push fails, and because publish.failOnError
+    # defaults false the Job still goes GREEN — only the pointer/registry
+    # asserts catch it. (Omitted once; caught exactly that way.)
+    plainHTTP: true

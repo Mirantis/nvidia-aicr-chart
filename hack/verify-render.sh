@@ -79,16 +79,30 @@ rejects_raw() {
 }
 
 # contains / omits <needle> <description> [helm --set args...]
+#
+# The render is captured and matched with `case`, never piped into `grep -q`:
+# under `set -o pipefail`, grep -q exits on the first match, the producer dies
+# of SIGPIPE, and pipefail turns a SUCCESSFUL match into a failed pipeline.
+# It only bites when the needle appears early in output large enough that the
+# producer is still writing — i.e. it would start flaking silently as the
+# chart grows. (Demonstrated in the kind e2e; fixed here pre-emptively.)
 contains() {
   local needle="$1" desc="$2"; shift 2
-  if helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null | grep -q -- "$needle"; then pass "$desc"
-  else fail "$desc — expected output to contain '$needle'"; fi
+  local out
+  out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null || true)
+  case "$out" in
+    *"$needle"*) pass "$desc" ;;
+    *)           fail "$desc — expected output to contain '$needle'" ;;
+  esac
 }
 omits() {
   local needle="$1" desc="$2"; shift 2
-  if helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null | grep -q -- "$needle"; then
-    fail "$desc — output unexpectedly contains '$needle'"
-  else pass "$desc"; fi
+  local out
+  out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null || true)
+  case "$out" in
+    *"$needle"*) fail "$desc — output unexpectedly contains '$needle'" ;;
+    *)           pass "$desc" ;;
+  esac
 }
 
 PUBLISH_ON=(--set validate.enabled=true --set validate.emitEvidence=true
