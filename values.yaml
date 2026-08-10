@@ -1,7 +1,14 @@
 # AICR recipe inputs. An EMPTY value omits that criteria flag entirely, letting
 # aicr use its detected/any value — the right choice for dimensions the target
 # recipe overlays don't define (many overlays are os- or platform-agnostic).
-accelerator: a100      # h100 | h200 | gb200 | gb300 | b200 | a100 | l40 | l40s | rtx-pro-6000
+#
+# There is deliberately NO default accelerator. The old default (a100 with
+# service=any) resolved the THINNEST recipe in the embedded catalog — 11
+# components vs 15 for a fully-specified leaf — silently. Rendering fails
+# unless you state an accelerator, set a dataPack (the pack owns criteria
+# completeness), or state a concrete service plus an intent (accelerator-less
+# leaves such as bcm+inference exist upstream).
+accelerator: ""        # h100 | h200 | gb200 | gb300 | b200 | a100 | l40 | l40s | rtx-pro-6000
 # intent must stay empty with service=any: at aicr v0.18.0 a stated intent
 # requires a service/os combination that declares it (aks/bcm/eks/lke/ocp/
 # gke+cos/oke) — `service: any` overlays declare service+accelerator only,
@@ -34,6 +41,14 @@ aicrSha256:
 # Install behavior
 storageClass: ""       # if non-empty, passed as --storage-class to `aicr bundle`
 recipeFlags: ""        # extra flags passed to `aicr recipe` (e.g. "--criteria-strict")
+# Extra flags passed to `aicr validate`. Notable production flags:
+#   --namespace <ns>              where validator Jobs run (default: aicr-validation)
+#   --image-pull-secret <name>    Secret for private validator images (repeatable;
+#                                 must exist in the validator Jobs' namespace)
+#   --node-selector k=v           pin validators to one node (burn-in pattern)
+# Tip: pass --namespace <release ns> and the SAME dockerconfigjson Secret used
+# for dataPackSecret can serve as the validator pull secret — one Secret total.
+validateFlags: ""
 # Extra flags passed to `aicr bundle`. Notable org-facing flags:
 #   --accelerated-node-toleration key=value:effect   tolerate tainted GPU nodes
 #   --system-node-selector key=value                 pin system components
@@ -57,15 +72,50 @@ environment:
   # so this single toggle sets both.
   preinstalledDriver: false
 
+# The deploy leg (bundle + deploy.sh). Set enabled: false for an ASSERT-ONLY
+# run: the Job still pulls the pack, resolves the recipe (the contract), and
+# captures it — then skips straight to validation. This is the burn-in /
+# scheduled re-validation / drift-check pattern: verify an already-converged
+# cluster against its recipe without touching a single Helm release.
+# Requires validate.enabled (a Job that neither deploys nor validates is a
+# no-op, and rendering fails accordingly).
+# If the cluster was never converged, validation fails closed — that is the
+# assertion working, not a malfunction.
+deploy:
+  enabled: true
 deployFlags: "--best-effort --no-wait"   # deploy.sh flags: --best-effort | --no-wait | --retries N
 runtimeImage: alpine/k8s:1.34.0          # base image (must include bash, curl, kubectl + helm)
 
-# Optional AICR --data extension pack (runtime catalog/criteria/validator
-# overlays — see aicr docs/integrator/data-extension.md). OCI artifact
-# reference WITHOUT a scheme, e.g. "ghcr.io/myorg/my-aicr-pack:1.0.0".
-# When set, an initContainer pulls it and every aicr invocation gets --data.
+# AICR --data extension pack (runtime catalog/criteria/validator overlays —
+# see aicr docs/integrator/data-extension.md). OCI artifact reference WITHOUT
+# a scheme, e.g. "ghcr.io/myorg/my-aicr-pack:1.0.0". When set, an
+# initContainer pulls it and every aicr invocation gets --data.
+#
+# This is the primary production path: an org pack that registers a private
+# service value (e.g. service: myorg) IS the recipe-naming mechanism, and it
+# carries the org's environment profile so the bundle needs no per-cluster
+# flags. See the README's "Bring your org's recipes" section.
 dataPack: ""
+# Name of an EXISTING Secret of type kubernetes.io/dockerconfigjson in the
+# release namespace, holding pull credentials for the dataPack registry.
+# Empty = anonymous pull (public artifacts only). The chart never creates
+# this Secret:
+#   kubectl create secret docker-registry aicr-pack-pull \
+#     --docker-server=ghcr.io --docker-username=... --docker-password=...
+dataPackSecret: ""
+# Transport for the pack pull — LAB/TEST ONLY, the mirror of
+# validate.publish.{plainHTTP,insecureTLS}. Production pack registries speak
+# TLS with a real CA; leave both false.
+dataPackPlainHTTP: false    # registry speaks plain HTTP (e.g. in-cluster registry:2)
+dataPackInsecureTLS: false  # registry has TLS but an untrusted certificate
 orasImage: ghcr.io/oras-project/oras:v1.2.0   # initContainer image for the pack pull
+
+# Resolved-recipe visibility: right after `aicr recipe` succeeds, the resolver's
+# own completion summary (criteria used, component count and names, overlay
+# count) plus the full recipe.yaml are captured to this ConfigMap
+# (create-or-update). This is how you audit that under-specified criteria did
+# not silently resolve a thinner stack than intended. Set "" to disable.
+recipeConfigMap: aicr-recipe
 
 # Optional post-install validation (aicr validate). Disabled by default: on
 # GPU-less clusters (kind included) the deployment phase legitimately fails
@@ -84,6 +134,45 @@ validate:
   resultConfigMap: aicr-validate-result
   emitEvidence: false           # also capture the --emit-attestation bundle
   evidenceConfigMap: aicr-evidence-bundle
+  # Publish the evidence bundle to an OCI registry (aicr evidence publish).
+  # Requires emitEvidence. The pointer.yaml locator is captured to the
+  # evidence ConfigMap either way.
+  publish:
+    enabled: false
+    # signed   — keyless Sigstore signing in-cluster. The identity token from
+    #            identityTokenSecret is exposed to aicr as
+    #            COSIGN_IDENTITY_TOKEN. NOTE: that token then lives inside a
+    #            pod whose ServiceAccount is bound to cluster-admin, and it
+    #            must still be VALID when the publish step runs — which is
+    #            AFTER deploy.sh and validation, potentially tens of minutes
+    #            after install. Short-lived tokens minted at install time
+    #            routinely expire before then.
+    # unsigned — push the bundle with an empty signer block; identity never
+    #            enters the cluster. Sign later from a trusted host:
+    #            `aicr evidence sign <pointer> --relocate`. Recommended for
+    #            regulated environments and scheduled runs.
+    mode: signed
+    # OCI reference to push to, e.g. ghcr.io/myorg/aicr-evidence. Required
+    # when enabled. The registry must support the OCI 1.1 Referrers API for
+    # signature attachment (GHCR, GitLab, Harbor >= 2.8, ECR, GAR, ACR,
+    # Artifactory) — a tag-schema fallback exists upstream.
+    ref: ""
+    # mode=signed only: existing Secret holding a short-lived OIDC identity
+    # token. Freshness is the operator's contract (mint -> write Secret ->
+    # install). Public Sigstore does not trust self-managed cluster issuers,
+    # so this is BYO by design.
+    identityTokenSecret:
+      name: ""
+      key: token
+    # Optional existing kubernetes.io/dockerconfigjson Secret with push
+    # credentials for the evidence registry. Empty = anonymous.
+    registrySecret: ""
+    # A publish failure fails the Job only when true. Default keeps publishing
+    # advisory: the verdict and bundle were already captured to ConfigMaps
+    # before the publish step ran.
+    failOnError: false
+    insecureTLS: false          # self-signed evidence registries
+    plainHTTP: false            # local registry testing (kind e2e)
 
 # Job
 job:
@@ -114,3 +203,9 @@ job:
   #    effect: NoSchedule
   affinity: {}
   priorityClassName: ""
+  # Extra environment variables for the installer container, passed through
+  # verbatim. For aicr knobs that are env-shaped rather than flag-shaped,
+  # e.g. the NCCL fabric selector used by benchmark validator catalogs:
+  #   extraEnv:
+  #     - {name: AICR_NCCL_FABRIC, value: roce}
+  extraEnv: []

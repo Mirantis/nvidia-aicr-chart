@@ -8,6 +8,42 @@
 {{- if and .Values.validate.enabled (not $phases) }}
 {{- fail "validate.enabled requires at least one non-empty entry in validate.phases (an empty list would make aicr run ALL phases, including performance)" }}
 {{- end }}
+{{- /* Criteria guard: the old default (a100 + service=any) silently resolved
+       the THINNEST recipe in the embedded catalog. Escapes are exact:
+       a stated accelerator; a dataPack (the org pack owns criteria
+       completeness); or a concrete service plus intent (accelerator-less
+       leaves like bcm+inference exist upstream). service "any" and its
+       documented aliases (self-managed, self, vanilla) are NOT concrete —
+       aicr rejects any+intent outright. */}}
+{{- if eq .Values.accelerator "any" }}
+{{- fail "accelerator: \"any\" is not a value — aicr rejects it as \"no criteria provided\". Leave accelerator empty and satisfy the criteria guard another way (dataPack, or concrete service plus intent), or state a real accelerator" }}
+{{- end }}
+{{- $svcConcrete := and .Values.service (not (has .Values.service (list "any" "self-managed" "self" "vanilla"))) }}
+{{- if and (not .Values.accelerator) (not .Values.dataPack) (not (and $svcConcrete .Values.intent)) }}
+{{- fail "no recipe criteria stated. Set accelerator (e.g. --set accelerator=h100), or set dataPack so your org pack owns criteria, or set a concrete service plus intent (e.g. service=bcm,intent=inference). Check valid combinations with: aicr recipe list --gpu <accelerator>" }}
+{{- end }}
+{{- /* Assert-only runs must actually assert something. */}}
+{{- if and (not .Values.deploy.enabled) (not .Values.validate.enabled) }}
+{{- fail "deploy.enabled=false requires validate.enabled=true: a Job that neither deploys nor validates is a no-op. Enable validation for an assert-only run, or set deploy.enabled=true" }}
+{{- end }}
+{{- $pub := .Values.validate.publish | default dict }}
+{{- if $pub.enabled }}
+{{- if not .Values.validate.enabled }}
+{{- fail "validate.publish.enabled requires validate.enabled: publishing needs a validation run to produce the evidence bundle" }}
+{{- end }}
+{{- if not .Values.validate.emitEvidence }}
+{{- fail "validate.publish.enabled requires validate.emitEvidence: without --emit-attestation there is no bundle to publish" }}
+{{- end }}
+{{- if not (has $pub.mode (list "signed" "unsigned")) }}
+{{- fail (printf "validate.publish.mode must be \"signed\" or \"unsigned\", got %q" ($pub.mode | toString)) }}
+{{- end }}
+{{- if not $pub.ref }}
+{{- fail "validate.publish.ref is required when publish is enabled: aicr evidence publish needs --push <oci-ref>, e.g. ghcr.io/myorg/aicr-evidence" }}
+{{- end }}
+{{- if and (eq $pub.mode "signed") (not ($pub.identityTokenSecret | default dict).name) }}
+{{- fail "validate.publish.mode=signed requires validate.publish.identityTokenSecret.name (an existing Secret holding a short-lived OIDC token) — or use mode=unsigned and sign later from a trusted host with `aicr evidence sign <pointer> --relocate`" }}
+{{- end }}
+{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -67,10 +103,12 @@ spec:
       {{- if .Values.dataPack }}
       initContainers:
         # Pull the AICR --data extension pack (OCI artifact) into the shared
-        # volume. Public artifacts only in this chart version.
+        # volume. With dataPackSecret set, oras authenticates from the mounted
+        # dockerconfigjson; a bad credential fails the initContainer — fail
+        # closed, never a silent fallback to anonymous.
         - name: data-pack
           image: {{ .Values.orasImage | quote }}
-          args: ["pull", {{ .Values.dataPack | quote }}, "-o", "/data/pack"]
+          args: ["pull", {{ .Values.dataPack | quote }}, "-o", "/data/pack"{{- if .Values.dataPackSecret }}, "--registry-config", "/pack-auth/config.json"{{- end }}{{- if .Values.dataPackPlainHTTP }}, "--plain-http"{{- end }}{{- if .Values.dataPackInsecureTLS }}, "--insecure"{{- end }}]
           env:
             - name: HOME          # oras writes config under $HOME; rootfs is read-only
               value: /data/pack
@@ -82,6 +120,17 @@ spec:
           volumeMounts:
             - name: pack
               mountPath: /data/pack
+            # oras stages downloaded blobs via temp files in /tmp before
+            # placing them in -o; with readOnlyRootFilesystem it needs a
+            # writable mount there (found by the kind e2e: "open
+            # /tmp/oras_file_...: read-only file system").
+            - name: pack-tmp
+              mountPath: /tmp
+            {{- if .Values.dataPackSecret }}
+            - name: pack-auth
+              mountPath: /pack-auth
+              readOnly: true
+            {{- end }}
       {{- end }}
       containers:
         - name: aicr
@@ -99,6 +148,11 @@ spec:
             {{- if .Values.dataPack }}
             - name: pack
               mountPath: /data/pack
+              readOnly: true
+            {{- end }}
+            {{- if and $pub.enabled $pub.registrySecret }}
+            - name: publish-auth
+              mountPath: /publish-auth
               readOnly: true
             {{- end }}
           env:
@@ -131,37 +185,72 @@ spec:
               value: {{ .Values.recipeFlags | quote }}
             - name: BUNDLE_FLAGS
               value: {{ .Values.bundleFlags | quote }}
-            {{- /* Booleans render through Helm truthiness rather than `| quote`
-                   so a value like `1` cannot be truthy to the template and false
-                   to the script's `= "true"` test — which would silently skip
-                   the profile while the Job still reported success. */}}
+            {{- /* Booleans render via the nvidia-aicr.bool helper (see
+                   _helpers.tpl for why truthiness, not `| quote`). */}}
             - name: ENV_K0S_CONTAINERD
-              value: {{ if .Values.environment.k0sContainerd }}"true"{{ else }}"false"{{ end }}
+              value: {{ include "nvidia-aicr.bool" .Values.environment.k0sContainerd }}
             - name: ENV_PREINSTALLED_DRIVER
-              value: {{ if .Values.environment.preinstalledDriver }}"true"{{ else }}"false"{{ end }}
+              value: {{ include "nvidia-aicr.bool" .Values.environment.preinstalledDriver }}
+            - name: DEPLOY_ENABLED
+              value: {{ include "nvidia-aicr.bool" .Values.deploy.enabled }}
             - name: DEPLOY_FLAGS
               value: {{ .Values.deployFlags | quote }}
             - name: DATA_PACK
               value: {{ .Values.dataPack | quote }}
             - name: VALIDATE_ENABLED
-              value: {{ if .Values.validate.enabled }}"true"{{ else }}"false"{{ end }}
+              value: {{ include "nvidia-aicr.bool" .Values.validate.enabled }}
             - name: VALIDATE_PHASES
               value: {{ join " " $phases | quote }}
             - name: VALIDATE_FAIL_ON_ERROR
-              value: {{ if .Values.validate.failOnError }}"true"{{ else }}"false"{{ end }}
+              value: {{ include "nvidia-aicr.bool" .Values.validate.failOnError }}
             - name: RESULT_CM
               value: {{ .Values.validate.resultConfigMap | quote }}
             - name: EMIT_EVIDENCE
-              value: {{ if .Values.validate.emitEvidence }}"true"{{ else }}"false"{{ end }}
+              value: {{ include "nvidia-aicr.bool" .Values.validate.emitEvidence }}
             - name: EVIDENCE_CM
               value: {{ .Values.validate.evidenceConfigMap | quote }}
+            - name: RECIPE_CM
+              value: {{ .Values.recipeConfigMap | default "" | quote }}
+            - name: PUBLISH_ENABLED
+              value: {{ include "nvidia-aicr.bool" $pub.enabled }}
+            - name: PUBLISH_MODE
+              value: {{ $pub.mode | default "signed" | quote }}
+            - name: PUBLISH_REF
+              value: {{ $pub.ref | default "" | quote }}
+            - name: PUBLISH_FAIL_ON_ERROR
+              value: {{ include "nvidia-aicr.bool" $pub.failOnError }}
+            - name: PUBLISH_INSECURE_TLS
+              value: {{ include "nvidia-aicr.bool" $pub.insecureTLS }}
+            - name: PUBLISH_PLAIN_HTTP
+              value: {{ include "nvidia-aicr.bool" $pub.plainHTTP }}
+            {{- /* Render-time decision, not a runtime dir probe: set exactly
+                   when registrySecret mounts /publish-auth. */}}
+            - name: PUBLISH_DOCKER_CONFIG
+              value: {{ if and $pub.enabled $pub.registrySecret }}"/publish-auth"{{ else }}""{{ end }}
+            {{- if and $pub.enabled (eq ($pub.mode | default "signed") "signed") }}
+            {{- /* Present ONLY in signed mode — absent, not empty, in unsigned
+                   mode, so an unsigned run can never pick up a stale identity. */}}
+            - name: COSIGN_IDENTITY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $pub.identityTokenSecret.name | quote }}
+                  key: {{ $pub.identityTokenSecret.key | default "token" | quote }}
+            {{- end }}
+            - name: VALIDATE_FLAGS
+              value: {{ .Values.validateFlags | default "" | quote }}
             - name: RESULT_NS
               value: {{ .Release.Namespace | quote }}
+            {{- with .Values.job.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           command:
             - /bin/bash
             - -c
             - |
               set -euo pipefail
+              # Single ConfigMap payload budget for every capture (recipe,
+              # evidence). ~900KiB: client-side apply caps around 1MiB.
+              CM_BUDGET=921600
               echo "=== AICR install Job starting ==="
               echo "Version=${AICR_VERSION}  Arch=${AICR_ARCH}"
               echo "Recipe inputs: service=${SERVICE} accelerator=${ACCELERATOR} os=${OS} intent=${INTENT} platform=${PLATFORM}"
@@ -209,9 +298,42 @@ spec:
               [ -n "${PLATFORM}" ]    && RECIPE_ARGS+=(--platform "${PLATFORM}")
               # RECIPE_FLAGS/BUNDLE_FLAGS/DEPLOY_FLAGS are intentionally
               # word-split: freeform passthrough for extra CLI flags.
-              ./aicr recipe "${RECIPE_ARGS[@]}" "${DATA_ARGS[@]}" ${RECIPE_FLAGS}
+              # tee'd so the resolver's own completion line (component count
+              # and names) can be captured; pipefail keeps failure fatal.
+              ./aicr recipe "${RECIPE_ARGS[@]}" "${DATA_ARGS[@]}" ${RECIPE_FLAGS} 2>&1 | tee ./recipe.log
               echo "Recipe size: $(wc -l < ./recipe.yaml) lines"
 
+              # Resolved-recipe visibility: under-specified criteria resolve a
+              # THINNER stack with exit 0 and no warning. The captured summary
+              # is how an operator audits what actually resolved.
+              if [ -n "${RECIPE_CM}" ]; then
+                {
+                  echo "criteria: service=${SERVICE} accelerator=${ACCELERATOR} os=${OS} intent=${INTENT} platform=${PLATFORM}"
+                  [ -n "${RECIPE_FLAGS}" ] && echo "recipeFlags: ${RECIPE_FLAGS}"
+                  [ -n "${DATA_PACK}" ]    && echo "dataPack: ${DATA_PACK}"
+                  grep -o "recipe generation completed.*" ./recipe.log || true
+                } > ./summary.txt
+                RECIPE_CM_ARGS=(--from-file=summary.txt=./summary.txt)
+                if [ "$(wc -c < ./recipe.yaml)" -lt "${CM_BUDGET}" ]; then
+                  RECIPE_CM_ARGS+=(--from-file=recipe.yaml=./recipe.yaml)
+                else
+                  echo "WARN: recipe.yaml exceeds the ConfigMap budget; capturing summary only"
+                fi
+                # Advisory by design (spec: "report-only" visibility): a capture
+                # failure must never abort an install that would otherwise
+                # succeed — this runs BEFORE deploy.sh.
+                if kubectl create configmap "${RECIPE_CM}" -n "${RESULT_NS}" \
+                  "${RECIPE_CM_ARGS[@]}" \
+                  --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -; then
+                  echo "Resolved recipe written to configmap ${RESULT_NS}/${RECIPE_CM}"
+                else
+                  echo "WARN: recipe capture failed (continuing; visibility is advisory)"
+                fi
+              fi
+
+              if [ "${DEPLOY_ENABLED}" != "true" ]; then
+                echo "=== Skipping deploy (deploy.enabled=false): assert-only run ==="
+              else
               echo "=== Generating bundle ==="
               BUNDLE_ARGS=(--recipe ./recipe.yaml --deployer helm --output ./bundles)
               if [ -n "${STORAGE_CLASS}" ]; then
@@ -249,6 +371,7 @@ spec:
                 esac
               fi
               echo "=== AICR install complete ==="
+              fi
 
               if [ "${VALIDATE_ENABLED}" = "true" ]; then
                 cd /tmp
@@ -260,10 +383,21 @@ spec:
                   EVIDENCE_ARGS+=(--emit-attestation ./evidence)
                 fi
                 rc=0
+                # VALIDATE_FLAGS is intentionally word-split, like its recipe/
+                # bundle/deploy siblings: freeform passthrough for validate
+                # flags (--namespace, --image-pull-secret, --node-selector...).
                 ./aicr validate --recipe ./recipe.yaml "${PHASE_ARGS[@]}" \
                   "${DATA_ARGS[@]}" "${EVIDENCE_ARGS[@]}" \
-                  --output ./ctrf.json || rc=$?
+                  --output ./ctrf.json ${VALIDATE_FLAGS} || rc=$?
                 echo "aicr validate exit=${rc}"
+                # Upstream exit-code semantics, so the log is self-explaining:
+                case "${rc}" in
+                  0) ;;
+                  2) echo "  (exit 2: invalid input or readiness pre-flight failed — no validators ran)" ;;
+                  5) echo "  (exit 5: CLI-layer timeout before a check ran)" ;;
+                  8) echo "  (exit 8: one or more checks failed or were inconclusive — fails closed)" ;;
+                  *) echo "  (unexpected validate exit code)" ;;
+                esac
 
                 # Capture the verdict UNCONDITIONALLY (pass or fail): aicr's
                 # own per-phase CTRF ConfigMaps are removed at its run cleanup.
@@ -277,21 +411,59 @@ spec:
                 else
                   echo "WARN: validate produced no ctrf.json (exit=${rc})"
                 fi
+                # Publish BEFORE the evidence capture: `aicr evidence publish`
+                # writes pointer.yaml into the bundle directory, so capturing
+                # afterwards archives the bundle together with its locator.
+                prc=0
+                if [ "${PUBLISH_ENABLED}" = "true" ]; then
+                  if [ -d ./evidence ]; then
+                    echo "=== Publishing evidence (mode: ${PUBLISH_MODE}) ==="
+                    PUB_ARGS=(--push "${PUBLISH_REF}" --yes)
+                    [ "${PUBLISH_MODE}" = "unsigned" ]     && PUB_ARGS+=(--no-sign)
+                    [ "${PUBLISH_INSECURE_TLS}" = "true" ] && PUB_ARGS+=(--insecure-tls)
+                    [ "${PUBLISH_PLAIN_HTTP}" = "true" ]   && PUB_ARGS+=(--plain-http)
+                    # DOCKER_CONFIG is scoped to this one invocation so the
+                    # push credential can never leak into deploy.sh's helm
+                    # pulls. ${VAR:+...} expands to a single KEY=VALUE word
+                    # when set, to nothing when empty — one invocation, no
+                    # duplicated command to drift.
+                    env ${PUBLISH_DOCKER_CONFIG:+DOCKER_CONFIG="${PUBLISH_DOCKER_CONFIG}"} \
+                      ./aicr evidence publish ./evidence "${PUB_ARGS[@]}" || prc=$?
+                    echo "evidence publish exit=${prc}"
+                  else
+                    echo "WARN: publish enabled but validate emitted no ./evidence directory"
+                    prc=1
+                  fi
+                fi
+
                 if [ "${EMIT_EVIDENCE}" = "true" ] && [ -d ./evidence ]; then
                   tar czf ./evidence.tgz -C ./evidence .
                   SIZE=$(wc -c < ./evidence.tgz)
-                  if [ "${SIZE}" -lt 921600 ]; then
-                    kubectl create configmap "${EVIDENCE_CM}" -n "${RESULT_NS}" \
-                      --from-file=evidence.tgz=./evidence.tgz \
-                      --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
-                    echo "Evidence bundle (${SIZE} bytes) written to configmap ${RESULT_NS}/${EVIDENCE_CM}"
+                  EVIDENCE_CM_ARGS=()
+                  if [ "${SIZE}" -lt "${CM_BUDGET}" ]; then
+                    EVIDENCE_CM_ARGS+=(--from-file=evidence.tgz=./evidence.tgz)
+                  elif [ -f ./evidence/pointer.yaml ]; then
+                    echo "WARN: evidence bundle ${SIZE} bytes exceeds the ConfigMap budget; capturing pointer only"
                   else
                     echo "WARN: evidence bundle ${SIZE} bytes exceeds the ConfigMap budget; not stored"
+                  fi
+                  # The pointer is the locator a verifier needs; captured as
+                  # its own plaintext key whenever publish produced one.
+                  [ -f ./evidence/pointer.yaml ] && EVIDENCE_CM_ARGS+=(--from-file=pointer.yaml=./evidence/pointer.yaml)
+                  if [ "${#EVIDENCE_CM_ARGS[@]}" -gt 0 ]; then
+                    kubectl create configmap "${EVIDENCE_CM}" -n "${RESULT_NS}" \
+                      "${EVIDENCE_CM_ARGS[@]}" \
+                      --dry-run=client -o yaml | kubectl apply --server-side --force-conflicts -f -
+                    echo "Evidence artifacts written to configmap ${RESULT_NS}/${EVIDENCE_CM}"
                   fi
                 fi
                 if [ "${rc}" -ne 0 ] && [ "${VALIDATE_FAIL_ON_ERROR}" = "true" ]; then
                   echo "=== Validation FAILED (exit ${rc}) ==="
                   exit "${rc}"
+                fi
+                if [ "${prc}" -ne 0 ] && [ "${PUBLISH_FAIL_ON_ERROR}" = "true" ]; then
+                  echo "=== Evidence publish FAILED (exit ${prc}) ==="
+                  exit "${prc}"
                 fi
               fi
               echo "=== AICR Job complete ==="
@@ -301,4 +473,26 @@ spec:
         {{- if .Values.dataPack }}
         - name: pack
           emptyDir: {}
+        - name: pack-tmp
+          emptyDir: {}
+        {{- end }}
+        {{- if and .Values.dataPack .Values.dataPackSecret }}
+        - name: pack-auth
+          secret:
+            secretName: {{ .Values.dataPackSecret | quote }}
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+            # Group-readable (0440), not 0400: secret files are root-owned and
+            # the container reads them as uid 65532 via fsGroup.
+            defaultMode: 0440
+        {{- end }}
+        {{- if and $pub.enabled $pub.registrySecret }}
+        - name: publish-auth
+          secret:
+            secretName: {{ $pub.registrySecret | quote }}
+            items:
+              - key: .dockerconfigjson
+                path: config.json
+            defaultMode: 0440
         {{- end }}

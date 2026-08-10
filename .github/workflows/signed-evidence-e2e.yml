@@ -1,0 +1,157 @@
+name: Signed evidence e2e
+
+# The one place a Sigstore-trusted identity is available for free: GitHub
+# Actions ambient OIDC. Public Fulcio does not trust self-managed cluster
+# issuers, so this path cannot be tested on kind alone.
+#
+# Why the publish leg runs on the RUNNER and not through the chart's
+# `validate.publish.mode=signed`: GitHub OIDC tokens live ~5 minutes, and the
+# chart's publish step runs after deploy.sh + validation — tens of minutes
+# after any token minted at install time has expired. Upstream built
+# `aicr evidence publish` exactly for this split ("validate where the cluster
+# is reachable... then publish from a host with Sigstore egress"), and the
+# artifact is content-addressable, so the result is identical to an in-pod
+# signed push. The chart's signed-mode template plumbing is covered by
+# hack/verify-render.sh; the unsigned in-pod publish path is covered by the
+# kind e2e (hack/e2e/run-kind-e2e.sh, .github/workflows/kind-e2e.yml).
+#
+# Experimental: exercises a full kind install (~20 min end to end).
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # ambient OIDC for keyless signing
+
+env:
+  EVIDENCE_REF: ghcr.io/${{ github.repository_owner }}/charts/aicr-evidence-ci
+
+jobs:
+  signed-evidence:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0
+
+      - name: Create kind cluster (K8s 1.34 — DRA floor)
+        uses: helm/kind-action@v1
+        with:
+          node_image: kindest/node:v1.34.0
+          cluster_name: aicr-evidence
+
+      # Single source of truth: the version the chart pins (Chart.yaml
+      # appVersion) and the reviewed strict sha pin (values.yaml
+      # aicrSha256.amd64) — CI must test the same binary the chart installs,
+      # with the same supply-chain posture.
+      - name: Resolve aicr version and strict pin from the chart
+        id: aicr
+        run: |
+          set -euo pipefail
+          V="$(awk -F'"' '/^appVersion:/ {print $2}' Chart.yaml)"
+          PIN="$(awk -F'"' '/^  amd64:/ {print $2}' values.yaml)"
+          test -n "$V" && test -n "$PIN"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "pin=$PIN"    >> "$GITHUB_OUTPUT"
+          echo "aicr $V, strict pin ${PIN:0:12}..."
+
+      - name: Install the chart (kind overlay, validation off)
+        run: |
+          set -euo pipefail
+          helm install nvidia-aicr . \
+            -n aicr --create-namespace \
+            --set service=kind --set accelerator=h100 --set intent=training
+          # kubectl wait on a single condition never returns early on the
+          # OTHER terminal state — a failed Job would burn the full timeout.
+          # Poll both conditions; dump logs on failure.
+          for i in $(seq 1 150); do
+            c=$(kubectl get job nvidia-aicr-install-1 -n aicr \
+                -o jsonpath='{.status.conditions[?(@.status=="True")].type}' 2>/dev/null || true)
+            case "$c" in
+              *Complete*) echo "Job complete"; exit 0 ;;
+              *Failed*)
+                echo "::error::install Job failed"
+                kubectl logs job/nvidia-aicr-install-1 -n aicr --tail=100 || true
+                exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::install Job did not finish within 25m"
+          kubectl logs job/nvidia-aicr-install-1 -n aicr --tail=100 || true
+          exit 1
+
+      - name: Download aicr onto the runner (chart-pinned, strict-verified)
+        env:
+          AICR_VERSION: ${{ steps.aicr.outputs.version }}
+          AICR_PIN: ${{ steps.aicr.outputs.pin }}
+        run: |
+          set -euo pipefail
+          TARBALL="aicr_${AICR_VERSION#v}_linux_amd64.tar.gz"
+          BASE="https://github.com/NVIDIA/aicr/releases/download/${AICR_VERSION}"
+          curl -fsSL -o "$TARBALL" "$BASE/$TARBALL"
+          curl -fsSL -o aicr_checksums.txt "$BASE/aicr_checksums.txt"
+          grep " ${TARBALL}\$" aicr_checksums.txt | sha256sum -c -
+          # Same strict pin the chart applies: trust reviewed values, not
+          # release assets fetched moments ago.
+          echo "${AICR_PIN}  ${TARBALL}" | sha256sum -c -
+          tar xzf "$TARBALL" && chmod +x ./aicr && ./aicr --version
+
+      - name: Resolve recipe and validate (emit bundle, no push)
+        run: |
+          set -euo pipefail
+          ./aicr recipe --service kind --accelerator h100 --intent training \
+            -o ./recipe.yaml
+          # Exit code tolerated: on GPU-less kind some validators legitimately
+          # skip or come back inconclusive; the bundle still emits.
+          ./aicr validate --recipe ./recipe.yaml --phase deployment \
+            --emit-attestation ./out --output ./ctrf.json || echo "validate exit=$? (tolerated)"
+          test -d ./out/summary-bundle
+
+      - name: Log in to ghcr (push credentials for the evidence artifact)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Publish SIGNED (ambient Actions OIDC, fresh at publish time)
+        run: |
+          set -euo pipefail
+          REF="$(echo "$EVIDENCE_REF" | tr '[:upper:]' '[:lower:]')"
+          ./aicr evidence publish ./out --push "$REF" --yes
+
+      - name: Assert the pointer carries a non-empty signer
+        run: |
+          set -euo pipefail
+          test -f ./out/pointer.yaml
+          echo "--- pointer.yaml ---"; cat ./out/pointer.yaml
+          # Parse the YAML rather than pattern-matching text: a populated
+          # signer renders in block style as a bare `signer:` line followed
+          # by indented fields, which a line-regex cannot distinguish from
+          # the empty-signer block `--no-sign` writes.
+          python3 - <<'EOF'
+          import sys, yaml
+          d = yaml.safe_load(open("./out/pointer.yaml"))
+          def find_signer(node):
+              if isinstance(node, dict):
+                  if "signer" in node:
+                      return True, node["signer"]
+                  for v in node.values():
+                      found, s = find_signer(v)
+                      if found:
+                          return True, s
+              elif isinstance(node, list):
+                  for v in node:
+                      found, s = find_signer(v)
+                      if found:
+                          return True, s
+              return False, None
+          found, signer = find_signer(d)
+          if not found:
+              sys.exit("::error::pointer.yaml has no signer field at all")
+          if not signer:
+              sys.exit("::error::signer block is empty — publish did not sign")
+          print("signer block:", signer)
+          EOF

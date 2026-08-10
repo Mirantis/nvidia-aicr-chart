@@ -1,0 +1,23 @@
+# acme's named recipe for the kind-based lab fleet.
+#
+# `service: acme` is a --data-PRIVATE criteria value: declaring it here
+# registers it with AICR's criteria registry at catalog-load time (upstream
+# docs/integrator/data-extension.md — "adding a new value to an overlay
+# automatically makes it a valid CLI input"). It never exists upstream;
+# --criteria-strict rejects it by design, which is the CI gate proving the
+# pack carries no accidental upstream dependencies.
+#
+# Resolve with:
+#   aicr recipe --service acme --accelerator h100 --intent training \
+#     --data ./acme-aicr-pack -o recipe.yaml
+apiVersion: aicr.run/v1alpha2
+kind: RecipeMetadata
+metadata:
+  name: acme-kind-training
+spec:
+  # Implicit inheritance from base: the recipe carries the full NVIDIA
+  # runtime component set; this overlay only names the criteria chain.
+  criteria:
+    service: acme         # --data-private value (registers on load)
+    accelerator: h100     # OSS-embedded value
+    intent: training      # valid because this overlay declares the chain

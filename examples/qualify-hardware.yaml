@@ -1,0 +1,23 @@
+# Posture: QUALIFY HARDWARE (commissioning burn-in, benchmarks).
+# The stack is already converged (day1-install ran earlier); this run
+# ASSERTS capability without touching a single Helm release. The
+# performance-phase validators come from the org pack; run one box at a
+# time via --node-selector.
+deploy:
+  enabled: false              # assert-only: skip bundle+deploy entirely
+service: acme
+accelerator: h200
+intent: training
+dataPack: "ghcr.io/acme/acme-aicr-pack:1.0.0"
+dataPackSecret: "aicr-pack-pull"
+validateFlags: "--namespace aicr --image-pull-secret aicr-pack-pull --node-selector kubernetes.io/hostname=CHANGE-ME"
+
+validate:
+  enabled: true               # required with deploy.enabled: false
+  phases: [performance]       # capability qualification: does the hardware deliver?
+  emitEvidence: true
+  publish:
+    enabled: true
+    mode: unsigned
+    ref: ghcr.io/acme/aicr-evidence
+    registrySecret: "aicr-pack-pull"

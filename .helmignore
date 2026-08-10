@@ -3,4 +3,9 @@
 .gitignore
 .github/
 hack/
+docs/
+examples/
+CHANGELOG.md
+CONTRIBUTING.md
+SECURITY.md
 *.tgz

@@ -1,0 +1,7 @@
+# acme-aicr-pack — component registry stub.
+# REQUIRED at the pack root by AICR's --data loader even when the pack adds
+# no components (upstream docs/integrator/data-extension.md: "registry.yaml
+# is required"). components: [] means "no additions; merge nothing".
+apiVersion: aicr.run/v1alpha2
+kind: ComponentRegistry
+components: []

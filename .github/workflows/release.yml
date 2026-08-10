@@ -1,6 +1,6 @@
 name: Release
 
-# Publish a chart release: `git tag v0.1.1 && git push --tags`.
+# Publish a chart release: `git tag v0.1.0 && git push --tags`.
 #
 # workflow_dispatch is accepted only when run against a tag ref — dispatching
 # from a branch is rejected, so a release can never be cut from a moving branch

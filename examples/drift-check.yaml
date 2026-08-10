@@ -1,0 +1,22 @@
+# Posture: RE-CERTIFY / DRIFT CHECK (scheduled, pre-upgrade).
+# Assert an already-converged cluster still matches its recipe. A missing
+# or unhealthy component FAILS the deployment phase — that is the check
+# working. failOnError decides whether the Job itself goes red.
+deploy:
+  enabled: false              # assert-only
+service: acme
+accelerator: h200
+intent: training
+dataPack: "ghcr.io/acme/acme-aicr-pack:1.0.0"
+dataPackSecret: "aicr-pack-pull"
+
+validate:
+  enabled: true
+  phases: [deployment]        # rollout verification against the same contract
+  failOnError: true           # red Job on drift
+  emitEvidence: true
+  publish:
+    enabled: true
+    mode: unsigned
+    ref: ghcr.io/acme/aicr-evidence
+    registrySecret: "aicr-pack-pull"

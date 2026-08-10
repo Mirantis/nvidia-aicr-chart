@@ -1,0 +1,34 @@
+nvidia-aicr {{ .Chart.Version }} (aicr {{ .Chart.AppVersion }}) installed.
+
+Job {{ .Release.Name }}-install-{{ .Release.Revision }} is converging the
+NVIDIA stack in namespace {{ .Release.Namespace }}. Expect minutes to tens of
+minutes depending on cluster and image pulls.
+
+Follow the install:
+
+  kubectl logs -n {{ .Release.Namespace }} -f job/{{ .Release.Name }}-install-{{ .Release.Revision }}
+{{- if .Values.recipeConfigMap }}
+
+Audit what resolved (criteria, component count and names):
+
+  kubectl get cm {{ .Values.recipeConfigMap }} -n {{ .Release.Namespace }} -o jsonpath='{.data.summary\.txt}'
+{{- end }}
+{{- if .Values.validate.enabled }}
+
+Validation is enabled (phases: {{ join ", " .Values.validate.phases }}). Read
+the CTRF verdict once the Job completes:
+
+  kubectl get cm {{ .Values.validate.resultConfigMap }} -n {{ .Release.Namespace }} -o jsonpath='{.data.ctrf\.json}'
+{{- if .Values.validate.emitEvidence }}
+
+The evidence bundle lands in ConfigMap {{ .Values.validate.evidenceConfigMap }}.
+{{- end }}
+{{- if (.Values.validate.publish | default dict).enabled }}
+The bundle is published ({{ .Values.validate.publish.mode }}) to
+{{ .Values.validate.publish.ref }}; the pointer is captured as key
+pointer.yaml on ConfigMap {{ .Values.validate.evidenceConfigMap }}.
+{{- end }}
+{{- end }}
+
+NOTE: do not `helm upgrade` while an install Job is still running — Helm
+deletes the previous revision's Job, killing deploy.sh mid-run. Let it finish.

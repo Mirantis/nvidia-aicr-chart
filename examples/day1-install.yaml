@@ -1,0 +1,20 @@
+# Posture: INSTALL & PROVE (day-1, fleet converge).
+# Deploy the stack, then verify the rollout — the chart's default story.
+# Swap the acme pack for your org's, or drop dataPack* and state full
+# criteria from the embedded catalog (see README "Which criteria?").
+service: acme
+accelerator: h200
+intent: training
+dataPack: "ghcr.io/acme/acme-aicr-pack:1.0.0"
+dataPackSecret: "aicr-pack-pull"
+
+validate:
+  enabled: true
+  phases: [deployment]        # rollout verification: is the recipe installed and healthy?
+  failOnError: true           # gate the Job on the verdict
+  emitEvidence: true
+  publish:
+    enabled: true
+    mode: unsigned            # sign later from CI: aicr evidence sign <pointer> --relocate
+    ref: ghcr.io/acme/aicr-evidence
+    registrySecret: "aicr-pack-pull"
