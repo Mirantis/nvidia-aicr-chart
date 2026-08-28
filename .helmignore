@@ -9,3 +9,4 @@ CHANGELOG.md
 CONTRIBUTING.md
 SECURITY.md
 *.tgz
+.tmp/

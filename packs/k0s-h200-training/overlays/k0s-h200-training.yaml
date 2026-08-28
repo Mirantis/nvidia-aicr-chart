@@ -1,0 +1,100 @@
+# A named recipe for NVIDIA training on bare-metal Kubernetes running k0s.
+#
+# WHY THIS PACK EXISTS: upstream AICR has no service value for on-prem /
+# bare-metal Kubernetes. Its only non-cloud overlay is `kind`, which assumes
+# the host has BOTH the driver and the container toolkit pre-configured
+# (nvkind does that) and disables both plus DCGM. A real bare-metal box is
+# the mirror image: the driver IS installed, the toolkit is NOT, and the GPUs
+# are real so DCGM should stay on. `intent: training` additionally requires a
+# concrete service upstream — of {aks,bcm,eks,lke,ocp,gke,oke} none describe
+# this machine. Hence `service: k0s`, registered here.
+#
+# Resolve with:
+#   aicr recipe --service k0s --accelerator h200 --intent training \
+#     --data ./packs/k0s-h200-training -o recipe.yaml
+apiVersion: aicr.run/v1alpha2
+kind: RecipeMetadata
+metadata:
+  name: k0s-h200-training
+spec:
+  criteria:
+    service: k0s          # --data-private value (registers on load)
+    accelerator: h200     # OSS-embedded value
+    intent: training      # valid because this overlay declares the chain
+
+  # k0s ships k8s >= 1.34 on v1.36.x; matches the upstream training leaves.
+  constraints:
+    - name: K8s.server.version
+      value: ">= 1.34"
+
+  componentRefs:
+    # Two different kinds of fact ride under this single `service: k0s`
+    # value below, and a future upstream contributor should not conflate
+    # them:
+    #   - k0s-GENERAL, upstream-portable: gpu-operator's `toolkit.env`
+    #     (the containerd socket/config/runtime-class paths, a few lines
+    #     down). k0s bundles its own containerd instead of using the
+    #     distro default; this is true of ANY k0s node, not just this one.
+    #     A general upstream `service: k0s` overlay should carry only this.
+    #   - THIS-FLEET-ONLY, not a k0s fact at all: `driver.enabled: false`
+    #     + nvidia-dra-driver-gpu's `nvidiaDriverRoot: /` (plenty of
+    #     k0s+GPU clusters want gpu-operator to install the driver instead
+    #     — see upstream `bcm`, which does exactly that); `driver.rdma.
+    #     enabled: false` and `gdrcopy.enabled: false` (absence of
+    #     InfiniBand is a hardware fact of this one host, unrelated to
+    #     which distro runs); `gds.enabled: false` (absence of the
+    #     nvidia_fs module is likewise a hardware/host-config fact, not a
+    #     k0s fact); `migManager.enabled: false` (an operational policy
+    #     choice, not a k0s or hardware fact). These ride along here
+    #     because this pack is scoped to one demo fleet — not because
+    #     registering `service: k0s` implies any of them.
+    - name: gpu-operator
+      type: Helm
+      overrides:
+        driver:
+          # Host carries the driver (verified 610.57.04). The operator must
+          # not install its own. MUST be paired with the DRA driver's
+          # nvidiaDriverRoot below — aicr's driver-ownership coherence check
+          # exits 2 if only one side is set.
+          enabled: false
+          rdma:
+            # No RDMA/InfiniBand on this host — verified 2026-08-26: no
+            # ib_/rdma_/mlx kernel modules loaded, /sys/class/infiniband is
+            # empty, and nvidia_peermem is absent. GPUDirect RDMA has
+            # nothing to bind to.
+            enabled: false
+        toolkit:
+          # UNLIKE the upstream `kind` overlay, the toolkit IS installed:
+          # this host has no nvidia-container-toolkit. It must target k0s's
+          # own containerd, not the distro default — otherwise the toolkit
+          # configures the wrong containerd, reports success, and GPU pods
+          # fail with `no runtime for "nvidia" is configured`.
+          enabled: true
+          env:
+            - name: CONTAINERD_CONFIG
+              value: /etc/k0s/containerd.d/nvidia.toml
+            - name: CONTAINERD_SOCKET
+              value: /run/k0s/containerd.sock
+            - name: CONTAINERD_RUNTIME_CLASS
+              value: nvidia
+        gds:
+          # GPUDirect Storage needs the nvidia_fs kernel module, not loaded here.
+          enabled: false
+        gdrcopy:
+          # GDRCopy accelerates GPUDirect RDMA transfers specifically; the
+          # same verified absence of RDMA/InfiniBand as driver.rdma above
+          # means there is no RDMA fabric for it to accelerate.
+          enabled: false
+        migManager:
+          # Off: MIG (re)configuration is disruptive to already-running
+          # workloads (it can require draining/rebooting a node), so it
+          # should be an explicit opt-in rather than a default this pack
+          # forces on every k0s+H200 cluster.
+          enabled: false
+
+    - name: nvidia-dra-driver-gpu
+      type: Helm
+      overrides:
+        # Host-installed driver userspace lives at the host root. Required
+        # counterpart to gpu-operator driver.enabled=false (see above).
+        nvidiaDriverRoot: /
