@@ -98,3 +98,19 @@ spec:
         # Host-installed driver userspace lives at the host root. Required
         # counterpart to gpu-operator driver.enabled=false (see above).
         nvidiaDriverRoot: /
+
+    - name: nvsentinel
+      type: Helm
+      overrides:
+        labeler:
+          # aicr >= v0.19 adds a second driver-ownership coherence check:
+          # with the driver host-provided (gpu-operator driver.enabled=false
+          # above) there is no driver pod for NVSentinel's labeler to
+          # observe, and `aicr bundle` fails closed unless the labeler is
+          # told the driver is present — without it, several NVSentinel
+          # DaemonSets come up with 0 desired pods while the rest of the
+          # stack looks healthy. Pairs with driver.enabled=false /
+          # nvidiaDriverRoot=/ (this-fleet driver-ownership facts, see the
+          # scope note above). Verified 2026-08-30: v0.20.0 bundles cleanly
+          # with this override; v0.18.0 accepts it and bundles cleanly too.
+          assumeDriverInstalled: true

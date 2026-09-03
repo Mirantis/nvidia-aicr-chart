@@ -4,6 +4,30 @@ Format: [Keep a Changelog](https://keepachangelog.com/); versions are the
 chart's semver. `appVersion` tracks the pinned [aicr
 release](https://github.com/NVIDIA/aicr/releases) independently.
 
+## [0.2.0] — 2026-09-02
+
+- **aicr v0.20.0** is the pinned release (was v0.18.0). Both strict-pin
+  hashes now ship (`aicrSha256.amd64` and `.arm64`).
+- **nvsentinel driver-ownership gate** (aicr >= v0.19): the
+  `environment.preinstalledDriver` profile now also sets
+  `nv-sentinel:labeler.assumeDriverInstalled=true`, and the
+  `k0s-h200-training` pack carries the equivalent override — both verified
+  to bundle cleanly on v0.18.0 and v0.20.0.
+- **Deploy-failure detection** handles v0.20.0's `deploy.sh`, which exits
+  non-zero on component failure without `--best-effort` (v0.18.0 never
+  exited non-zero). The Job fails explicitly on any non-zero deploy exit
+  and still detects the failure-report line itself.
+- **Bundle verification gate**: the Job runs `aicr verify` on the rendered
+  bundle before executing `deploy.sh` — upstream's closed-world checksum
+  gate; any file added, removed, or modified after bundling fails the Job.
+- **Fleet secret delivery documented**: README section + worked example
+  (`examples/fleet/fleet-secret-distribution.yaml`) for landing the
+  pack/publish/validator dockerconfigjson on k0rdent children via Sveltos.
+- **Opt-in `dataPackAuth.dockerconfigjson`**: the chart creates the pack-pull
+  Secret from a value, for reconcilers with native secret-to-values
+  injection (Flux `valuesFrom`). Mutually exclusive with `dataPackSecret`,
+  which remains the default contract (the chart never creates it).
+
 ## [0.1.0] — 2026-08-11
 
 Initial release.

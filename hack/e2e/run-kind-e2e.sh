@@ -128,27 +128,48 @@ setup_cluster() {  # $1 = scenario name
 # run (observed: 31 MB agent image stuck ContainerCreating/Pulling for
 # 38 min; a fresh anonymous ghcr pull per run is exactly the throttling
 # shape). All of them use imagePullPolicy: IfNotPresent (agent verified
-# against the v0.18.0 binary; validators observed live, 2026-08-11), so
-# images side-loaded into the node are used as-is: pull once on the host —
-# cached across runs — and load them. A pull failure here fails fast and
-# visibly instead of burning validate's whole timeout.
+# against the v0.18.0 and v0.20.0 binaries; validators observed live,
+# 2026-08-11 and 2026-09-02), so pulling them into the node ahead of time
+# means the kubelet finds them already present. A pull failure here fails
+# fast and visibly instead of burning validate's whole timeout.
+#
+# Pulled with `ctr images pull` directly INSIDE the node's own containerd
+# (namespace k8s.io — the one kubelet/CRI reads), not host-side `docker
+# pull` + `docker save` + `kind load image-archive`: Docker Desktop
+# 29.7.2's containerd image store cannot re-export a platform-filtered save
+# of these GHCR images even though `docker inspect` reports the correct
+# platform — `docker save --platform linux/arm64
+# ghcr.io/nvidia/aicr:v0.20.0` fails with "no suitable export target found
+# ... does not provide the specified platform (linux/arm64)" (reproduces
+# identically on a fresh v0.18.0 pull, so it's a local Docker Desktop bug,
+# not an aicr image or version problem). Pulling straight into the node
+# sidesteps the host docker layer entirely, at the cost of the host-side
+# layer cache across repeated e2e runs that the old approach had.
+#
+# Every node, enumerated with `kind get nodes` — NOT a hardcoded
+# "${CLUSTER}-control-plane". The replaced `kind load image-archive --name
+# "$CLUSTER"` seeded ALL nodes; naming one node narrows that silently, and
+# the day setup_cluster grows a worker (or kind changes its node-naming
+# convention) a validator Job scheduled there would hit the exact 38-minute
+# ContainerCreating stall this function exists to prevent — with the preload
+# still reporting success.
 preload_validation_images() {
-  local v plat img tar
+  local v plat img out node nodes
   v="$(awk -F'"' '/^appVersion:/ {print $2}' "$CHART/Chart.yaml")"
   plat="linux/$(docker version -f '{{.Server.Arch}}')"
+  nodes=$(kind get nodes --name "$CLUSTER")
+  [ -n "$nodes" ] || { echo "preload FAILED: no kind nodes for $CLUSTER" >&2; exit 1; }
   for img in "ghcr.io/nvidia/aicr:${v}" \
              "ghcr.io/nvidia/aicr-validators/deployment:${v}"; do
-    echo "== [validate] preload $img ($plat) =="
-    docker pull --platform "$plat" "$img"
-    # Not `kind load docker-image`: with docker's containerd image store, a
-    # multi-arch tag saves as an index referencing platforms whose blobs
-    # were never pulled, and kind's `ctr import --all-platforms --digests`
-    # fails on the missing digest. Save the node's platform only
-    # (docker >= 25).
-    tar=$(mktemp)
-    docker save --platform "$plat" "$img" -o "$tar"
-    kind load image-archive "$tar" --name "$CLUSTER"
-    rm -f "$tar"
+    for node in $nodes; do
+      echo "== [validate] preload $img ($plat) -> $node =="
+      if ! out=$(docker exec "$node" \
+           ctr --namespace=k8s.io images pull --platform "$plat" "$img" 2>&1); then
+        printf '%s\n' "$out" | tail -20
+        echo "preload FAILED: $img on $node" >&2
+        exit 1
+      fi
+    done
   done
 }
 
@@ -363,7 +384,8 @@ sys.exit(0 if s['tests'] > 0 else 1)" \
     # a populated oci field is the real signal that the push happened.
     has_re 'oci:[[:space:]]*[^"[:space:]]' "$ptr" && pass "pointer records a published OCI ref" \
       || fail "pointer has no OCI ref — publish did not push"
-    # v0.18.0 --no-sign omits the signer field entirely (observed 2026-08-10).
+    # --no-sign omits the signer field entirely on v0.18.0 (observed
+    # 2026-08-10) and v0.20.0 (observed 2026-09-02).
     has "signer" "$ptr" && fail "unsigned pointer unexpectedly carries a signer" \
       || pass "pointer is unsigned (no signer field)"
     tgz=$(K -n aicr get cm aicr-evidence-bundle -o jsonpath='{.binaryData.evidence\.tgz}' 2>/dev/null || true)

@@ -48,6 +48,7 @@ Each override below is carried in [`overlays/k0s-h200-training.yaml`](overlays/k
 | `gpu-operator.gdrcopy.enabled` | `false` | GDRCopy accelerates GPUDirect RDMA transfers specifically; the same verified absence of RDMA/InfiniBand as `driver.rdma.enabled` above means there's no RDMA fabric for it to accelerate. |
 | `gpu-operator.migManager.enabled` | `false` | Off: MIG (re)configuration is disruptive to already-running workloads, so it should be an explicit opt-in rather than a default. |
 | `nvidia-dra-driver-gpu.nvidiaDriverRoot` | `/` | Host-installed driver userspace lives at the host root. **Required counterpart to `driver.enabled: false` above** — aicr's driver-ownership coherence check exits 2 if only one side is set. |
+| `nvsentinel.labeler.assumeDriverInstalled` | `true` | aicr >= v0.19's second driver-ownership coherence check: with a host-provided driver there is no driver pod for the labeler to observe; without this, several NVSentinel DaemonSets silently come up with 0 desired pods. Required counterpart to the driver-ownership pair above on aicr >= v0.19. |
 | constraint `K8s.server.version` | `>= 1.34` | k0s ships k8s >= 1.34 on v1.36.x; matches the upstream training leaves. |
 
 Two things this pack deliberately does *not* override, both confirmed absent from the resolved recipe's `gpu-operator` overrides:
@@ -57,7 +58,7 @@ Two things this pack deliberately does *not* override, both confirmed absent fro
 
 ## Resolving and verifying the pack
 
-Resolve it directly with the `aicr` CLI (no cluster, no GPU required):
+Resolve it directly with the `aicr` CLI (v0.20.0, the chart's pin; no cluster, no GPU required):
 
 ```bash
 aicr recipe --service k0s --accelerator h200 --intent training \
@@ -99,14 +100,5 @@ environment:
 
 ## Version compatibility
 
-- **aicr v0.18.0** — the version this chart pins (`aicrVersion` in `values.yaml`) — resolves and **bundles this pack cleanly**: all 11 resolved components render into a complete Helm bundle with no errors.
-- **aicr >= v0.19** (checked against v0.20.0) adds a second driver-ownership coherence check in `nv-sentinel`: when the driver is host-provided (`gpu-operator.driver.enabled: false`) and no driver pod exists for the labeler to observe, it now requires `nv-sentinel:labeler.assumeDriverInstalled=true` to be set explicitly, or several NVSentinel DaemonSets silently come up with 0 desired pods while the rest of the stack looks healthy. This pack does **not** yet carry that override, so bundling it on v0.20.0 fails by design:
-
-  ```
-  [cli] command failed: error=[INVALID_REQUEST] nvsentinel: the effective values leave the
-  NVIDIA driver to the node image (gpu-operator driver.enabled=false) and no driver pod the
-  NVSentinel labeler can observe is deployed, but labeler.assumeDriverInstalled is not set. ...
-  Set the documented upstream flag at bundle time: --set nv-sentinel:labeler.assumeDriverInstalled=true.
-  ```
-
-  `hack/verify-pack.sh` runs this exact forward check and asserts the failure (and its reason), so the day this pack needs updating for a newer `aicr` — either by carrying the override itself or once the chart's `environment.preinstalledDriver` profile is extended to set it — that assertion turns red and calls it out, rather than the gap drifting unnoticed.
+- **aicr v0.20.0** — the version the chart pins (`aicrVersion` in `values.yaml`) — resolves and bundles this pack cleanly, including the driver-ownership coherence check added in v0.19 (`nvsentinel` `labeler.assumeDriverInstalled`, carried by this pack since 2026-08-30).
+- **aicr v0.18.0** — the previous pin — also resolves and bundles cleanly; it accepts the `nvsentinel` override. `hack/verify-pack.sh` asserts both.
