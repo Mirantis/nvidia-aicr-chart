@@ -2,8 +2,8 @@ apiVersion: v2
 name: nvidia-aicr
 description: Installs the NVIDIA AI stack on a Kubernetes cluster by running NVIDIA AI Cluster Runtime (AICR) in a Job. The Job downloads a pinned, checksum-verified aicr release, generates a recipe from chart values, renders it into a Helm bundle, and executes the bundle's deploy.sh. AICR is consumed unmodified.
 type: application
-version: 0.1.0
-appVersion: "v0.18.0"
+version: 0.2.0
+appVersion: "v0.20.0"
 keywords:
   - nvidia
   - gpu

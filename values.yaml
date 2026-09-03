@@ -9,11 +9,12 @@
 # completeness), or state a concrete service plus an intent (accelerator-less
 # leaves such as bcm+inference exist upstream).
 accelerator: ""        # h100 | h200 | gb200 | gb300 | b200 | a100 | l40 | l40s | rtx-pro-6000
-# intent must stay empty with service=any: at aicr v0.18.0 a stated intent
-# requires a service/os combination that declares it (aks/bcm/eks/lke/ocp/
-# gke+cos/oke) — `service: any` overlays declare service+accelerator only,
-# so `intent: training` fails resolution outright. Set intent only together
-# with a service that provides it (e.g. service: kind, intent: training).
+# intent must stay empty with service=any: at aicr v0.20.0 (verified;
+# unchanged since v0.18.0) a stated intent requires a service/os combination
+# that declares it (aks/bcm/eks/lke/ocp/gke+cos/oke) — `service: any`
+# overlays declare service+accelerator only, so `intent: training` fails
+# resolution outright. Set intent only together with a service that
+# provides it (e.g. service: kind, intent: training).
 intent: ""             # "" (omit) | training | inference
 os: ""                 # "" (omit) | ubuntu | rhel | cos | amazonlinux | ol | talos
 platform: ""           # "" (omit) | kubeflow | dynamo | nim | runai | slurm
@@ -24,7 +25,7 @@ platform: ""           # "" (omit) | kubeflow | dynamo | nim | runai | slurm
 service: any
 
 # AICR binary
-aicrVersion: v0.18.0   # https://github.com/NVIDIA/aicr/releases
+aicrVersion: v0.20.0   # https://github.com/NVIDIA/aicr/releases
 aicrArch: amd64        # amd64 | arm64
 # Optional strict pin: sha256 of the release tarball, keyed by architecture
 # (from aicr_checksums.txt). When the entry for the selected aicrArch is
@@ -35,8 +36,8 @@ aicrArch: amd64        # amd64 | arm64
 # Keyed by arch so that switching aicrArch cannot silently check a tarball
 # against the wrong architecture's hash. Update on every aicrVersion bump.
 aicrSha256:
-  amd64: "6a498b8ce0dcb0e28095de35cdae583391ad567f3922aae6657c851cc76275ee"  # v0.18.0 linux_amd64
-  arm64: ""
+  amd64: "a80a7ed1ad7474434c929efbea77223b0eb156f901569319698e9bdb9e1126f9"  # v0.20.0 linux_amd64
+  arm64: "f8353a56ff430714818879c8b4c4de057c0e3cea11beb34f45e4753db8f300f5"  # v0.20.0 linux_arm64
 
 # Install behavior
 storageClass: ""       # if non-empty, passed as --storage-class to `aicr bundle`
@@ -68,8 +69,9 @@ environment:
   k0sContainerd: false
   # Nodes already carry an NVIDIA driver (host package, DKMS, or baked image):
   # the GPU operator must not install its own, and the DRA driver must read the
-  # host root. aicr's driver-ownership coherence check requires both together,
-  # so this single toggle sets both.
+  # host root. aicr's driver-ownership coherence check requires both together;
+  # aicr >= v0.19 additionally requires the NVSentinel labeler to be told the
+  # driver is host-provided, so the toggle sets all three together.
   preinstalledDriver: false
 
 # The deploy leg (bundle + deploy.sh). Set enabled: false for an ASSERT-ONLY
@@ -103,6 +105,19 @@ dataPack: ""
 #   kubectl create secret docker-registry aicr-pack-pull \
 #     --docker-server=ghcr.io --docker-username=... --docker-password=...
 dataPackSecret: ""
+# Opt-in alternative to dataPackSecret for reconcilers that inject secrets
+# as VALUES — Flux HelmRelease `valuesFrom: secretKeyRef`, or k0rdent MCS
+# `serviceSpec.services[].valuesFrom` ({kind: Secret, name}, resolved on
+# the management cluster): the raw dockerconfigjson JSON string. When
+# non-empty the chart CREATES the pull Secret (<release>-pack-auth)
+# itself. Mutually exclusive with dataPackSecret. Trade-off vs the
+# default: the material also lands in Helm release storage on the target
+# cluster and in whatever holds your values — always deliver it via a
+# secret reference (valuesFrom), never inline in git or an MCS spec. For
+# one credential serving pack pull + evidence publish + validator pulls,
+# prefer the fleet pattern in examples/fleet/fleet-secret-distribution.yaml.
+dataPackAuth:
+  dockerconfigjson: ""
 # Transport for the pack pull — LAB/TEST ONLY, the mirror of
 # validate.publish.{plainHTTP,insecureTLS}. Production pack registries speak
 # TLS with a real CA; leave both false.

@@ -54,8 +54,11 @@ jobs:
           echo "registry=oci://ghcr.io/${OWNER}/charts" >> "$GITHUB_OUTPUT"
           echo "Releasing ${CHART} to oci://ghcr.io/${OWNER}/charts"
 
+      # --strict + a valid criteria set, per CONTRIBUTING's dev loop: bare
+      # `helm lint .` reports "0 chart(s) failed" even when the criteria
+      # guard fails the render, so it cannot catch a broken template.
       - name: helm lint
-        run: helm lint .
+        run: helm lint . --strict --set accelerator=h100
 
       - name: Verify render
         run: ./hack/verify-render.sh .

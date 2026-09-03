@@ -5,6 +5,7 @@
        single-element list containing "", which is truthy but produces no
        --phase flags, making aicr run every phase including performance. */}}
 {{- $phases := compact (.Values.validate.phases | default list) }}
+{{- $packSecret := include "nvidia-aicr.packSecretName" . }}
 {{- if and .Values.validate.enabled (not $phases) }}
 {{- fail "validate.enabled requires at least one non-empty entry in validate.phases (an empty list would make aicr run ALL phases, including performance)" }}
 {{- end }}
@@ -108,7 +109,7 @@ spec:
         # closed, never a silent fallback to anonymous.
         - name: data-pack
           image: {{ .Values.orasImage | quote }}
-          args: ["pull", {{ .Values.dataPack | quote }}, "-o", "/data/pack"{{- if .Values.dataPackSecret }}, "--registry-config", "/pack-auth/config.json"{{- end }}{{- if .Values.dataPackPlainHTTP }}, "--plain-http"{{- end }}{{- if .Values.dataPackInsecureTLS }}, "--insecure"{{- end }}]
+          args: ["pull", {{ .Values.dataPack | quote }}, "-o", "/data/pack"{{- if $packSecret }}, "--registry-config", "/pack-auth/config.json"{{- end }}{{- if .Values.dataPackPlainHTTP }}, "--plain-http"{{- end }}{{- if .Values.dataPackInsecureTLS }}, "--insecure"{{- end }}]
           env:
             - name: HOME          # oras writes config under $HOME; rootfs is read-only
               value: /data/pack
@@ -126,7 +127,7 @@ spec:
             # /tmp/oras_file_...: read-only file system").
             - name: pack-tmp
               mountPath: /tmp
-            {{- if .Values.dataPackSecret }}
+            {{- if $packSecret }}
             - name: pack-auth
               mountPath: /pack-auth
               readOnly: true
@@ -346,7 +347,14 @@ spec:
               if [ "${ENV_PREINSTALLED_DRIVER}" = "true" ]; then
                 PROFILE_ARGS+=(--set gpuoperator:driver.enabled=false)
                 PROFILE_ARGS+=(--set dradriver:nvidiaDriverRoot=/)
-                echo "profile: preinstalled driver (gpu-operator driver off, DRA root /)"
+                # aicr >= v0.19: a host-provided driver leaves no driver pod
+                # for NVSentinel's labeler to observe; without this flag
+                # `aicr bundle` fails closed (v0.20.0) and several NVSentinel
+                # DaemonSets would otherwise come up with 0 desired pods.
+                # Accepted (and needed for coherence) on the pinned version;
+                # also accepted by v0.18.0. Verified 2026-08-30.
+                PROFILE_ARGS+=(--set nv-sentinel:labeler.assumeDriverInstalled=true)
+                echo "profile: preinstalled driver (gpu-operator driver off, DRA root /, nvsentinel labeler assumes driver)"
               fi
               if [ "${ENV_K0S_CONTAINERD}" = "true" ]; then
                 PROFILE_ARGS+=(--set-json 'gpuoperator:toolkit.env=[{"name":"CONTAINERD_CONFIG","value":"/etc/k0s/containerd.d/nvidia.toml"},{"name":"CONTAINERD_SOCKET","value":"/run/k0s/containerd.sock"},{"name":"CONTAINERD_RUNTIME_CLASS","value":"nvidia"}]')
@@ -355,14 +363,49 @@ spec:
               ./aicr bundle "${BUNDLE_ARGS[@]}" "${DATA_ARGS[@]}" "${PROFILE_ARGS[@]}" ${BUNDLE_FLAGS}
               ls -la ./bundles/
 
+              echo "=== Verifying bundle integrity ==="
+              # Upstream's canonical flow is `aicr verify . && ./deploy.sh`.
+              # In-Job bundles are created without --attest, so the achievable
+              # trust level is "unverified": a closed-world checksum gate, not
+              # provenance — but it fail-closes on any file added, removed, or
+              # modified between bundle and execution, fully offline.
+              # Verified 2026-09-01 (v0.20.0): clean bundle passes exit 0;
+              # tampered deploy.sh fails exit 4. Exists on v0.18.0 too.
+              #
+              # Handled explicitly rather than left to `set -e`: a bare
+              # non-zero exit here would fail the Job with no line saying
+              # WHY, and "install failed" with no reason is exactly what
+              # every other failure path in this script exists to avoid.
+              # aicr's own exit code is preserved (4 = integrity failure).
+              vrc=0
+              ./aicr verify ./bundles || vrc=$?
+              if [ "${vrc}" -ne 0 ]; then
+                echo "=== AICR install FAILED (aicr verify exit ${vrc}: the bundle changed between generation and execution, or its checksums.txt does not match) ==="
+                exit "${vrc}"
+              fi
+
               echo "=== Running deploy.sh ==="
-              # deploy.sh at aicr v0.18.0 does NOT exit non-zero on component
-              # failures (with or without --best-effort) — it only reports
-              # them. Detect the failure line ourselves so a partial install
-              # can never masquerade as success: with --best-effort we warn
-              # and continue (that is what the operator asked for); without
-              # it we fail the Job.
-              ( cd ./bundles && bash ./deploy.sh ${DEPLOY_FLAGS} ) 2>&1 | tee ./deploy.log
+              # deploy.sh semantics differ by aicr version (both verified
+              # against the release artifacts — house rule 2):
+              #   v0.18.0: NEVER exits non-zero on component failures; it
+              #            only prints "Deployment completed with failures".
+              #   v0.20.0: exits 1 on the first component failure when
+              #            --best-effort is absent; WITH --best-effort it
+              #            still exits 0 and prints the same report line
+              #            (now suffixed "(--best-effort): <components>").
+              # Handle both: a non-zero exit fails the Job with context, and
+              # the report line is still detected ourselves — so on either
+              # version a partial install can never masquerade as success.
+              rc=0
+              ( cd ./bundles && bash ./deploy.sh ${DEPLOY_FLAGS} ) 2>&1 | tee ./deploy.log || rc=$?
+              if [ "${rc}" -ne 0 ]; then
+                # Preserve deploy.sh's exit code (like the validate/publish
+                # paths): the Job exit code is a documented status surface,
+                # and flattening to 1 would erase e.g. bash's 126/127 or any
+                # future distinct upstream code.
+                echo "=== AICR install FAILED (deploy.sh exit ${rc}) ==="
+                exit "${rc}"
+              fi
               if grep -q "Deployment completed with failures" ./deploy.log; then
                 echo "WARN: deploy.sh reported component failures (see log above)"
                 case " ${DEPLOY_FLAGS} " in
@@ -476,10 +519,10 @@ spec:
         - name: pack-tmp
           emptyDir: {}
         {{- end }}
-        {{- if and .Values.dataPack .Values.dataPackSecret }}
+        {{- if and .Values.dataPack $packSecret }}
         - name: pack-auth
           secret:
-            secretName: {{ .Values.dataPackSecret | quote }}
+            secretName: {{ $packSecret | quote }}
             items:
               - key: .dockerconfigjson
                 path: config.json

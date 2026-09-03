@@ -4,10 +4,10 @@ A Helm chart that installs the NVIDIA AI stack on a Kubernetes cluster by runnin
 
 **Why this chart:**
 
-- **The validated matrix, not hand-picked versions.** One install converges a cluster on NVIDIA's tested combination of driver, operators, scheduler, and monitoring — component versions and ordering come from the pinned AICR release, never from this chart.
-- **Recipes become named, versioned artifacts.** An org [data pack](#bring-your-orgs-recipes---data-packs) registers your own criteria value (`service: yourorg`) and carries your environment profile — every cluster installs the same recipe by name, with zero per-cluster flags.
 - **GitOps-native delivery.** AICR is a CLI; this chart is the declarative envelope that lets fleet managers and reconcilers deliver it.
-- **Supply chain, end to end.** Checksum-pinned binary with an optional reviewed strict pin, captured CTRF verdicts, and evidence bundles published signed (Sigstore keyless) or unsigned-then-sign-later.
+- **The validated matrix, not hand-picked versions.** One install converges a cluster on NVIDIA's tested combination of driver, operators, scheduler, and monitoring — component versions and ordering come from the pinned AICR release.
+- **Recipes become named, versioned artifacts.** An org [data pack](#bring-your-orgs-recipes---data-packs) registers your own criteria value (`service: yourorg`) and carries your environment profile — every cluster installs the same recipe by name, with zero per-cluster flags.
+- **Supply chain, end to end.** Checksum-pinned binary with an optional reviewed strict pin, captured CTRF verdicts, and evidence bundles published signed or unsigned-then-sign-later.
 - **Operable and tested.** What resolved, what passed, and the proof all land in ConfigMaps; the chart itself ships with a mutation-tested render suite and a reproducible end-to-end test.
 
 The chart is one Kubernetes Job plus its ServiceAccount and RBAC. On the target cluster it:
@@ -16,12 +16,12 @@ The chart is one Kubernetes Job plus its ServiceAccount and RBAC. On the target 
 2. pulls your org's `--data` extension pack when one is configured,
 3. runs `aicr recipe` with the criteria supplied through chart values, and captures the resolved recipe to a ConfigMap,
 4. runs `aicr bundle` to render the recipe into a Helm bundle,
-5. executes the bundle's `deploy.sh` to install the stack,
+5. verifies the rendered bundle (`aicr verify`, closed-world checksums) and executes its `deploy.sh` to install the stack,
 6. optionally runs `aicr validate`, captures the verdict to a ConfigMap, and publishes the evidence bundle to an OCI registry.
 
 AICR is consumed unmodified — no wrapper logic, no duplicated behavior — so component versions and install ordering always come from the pinned upstream release.
 
-> **v0.1.0 is experimental.** It targets connected clusters. The install path is the proven core; data packs, validation, and evidence publishing are opt-in values, default off.
+> **v0.2.0 is experimental.** It targets connected clusters. The install path is the proven core; data packs, validation, and evidence publishing are opt-in values, default off.
 
 ## Install
 
@@ -29,7 +29,7 @@ There is no default accelerator — state your criteria (see ["Which criteria?"]
 
 ```bash
 helm install nvidia-aicr oci://ghcr.io/mirantis/charts/nvidia-aicr \
-  --version 0.1.0 \
+  --version 0.2.0 \
   --namespace nvidia-aicr --create-namespace \
   --set accelerator=h100
 ```
@@ -66,11 +66,11 @@ accelerator: h200
 intent: training
 ```
 
-See upstream `docs/integrator/data-extension.md` for pack authoring.
+See upstream [Data Extension](https://docs.nvidia.com/aicr/integrator-guide/data-extension/) for pack authoring.
 
 ### Private pack registries
 
-`dataPackSecret` names an **existing** Secret of type `kubernetes.io/dockerconfigjson` in the release namespace; the pull initContainer authenticates with it. Empty means anonymous (public artifacts only). The chart never creates the Secret:
+`dataPackSecret` names an **existing** Secret of type `kubernetes.io/dockerconfigjson` in the release namespace; the pull initContainer authenticates with it. Empty means anonymous (public artifacts only).
 
 ```bash
 kubectl create secret docker-registry aicr-pack-pull -n nvidia-aicr \
@@ -78,6 +78,29 @@ kubectl create secret docker-registry aicr-pack-pull -n nvidia-aicr \
 ```
 
 A bad or missing credential fails the initContainer visibly — fail-closed, never a silent fallback to anonymous.
+
+If your reconciler can inject secrets as values without putting them in git
+— Flux `HelmRelease` `valuesFrom: secretKeyRef`, or k0rdent
+`MultiClusterService` `serviceSpec.services[].valuesFrom` — `dataPackAuth.dockerconfigjson`
+lets the chart create the Secret instead. The credential then also lives in Helm release
+storage on the target cluster: that is the trade-off you accept.
+The default remains: the chart never creates the Secret.
+
+### Landing the Secret on fleet children
+
+On a k0rdent fleet, kcm bundles Sveltos: keep **one** wrapper Secret on the management cluster
+and a `ClusterProfile` whose selector matches the same labels your
+`MultiClusterService` uses — Sveltos applies the wrapped dockerconfigjson
+(and its namespace) to every matched child, and rotation is one `kubectl
+apply` on the mothership. Worked example with ordering caveats:
+[`examples/fleet/fleet-secret-distribution.yaml`](examples/fleet/fleet-secret-distribution.yaml)
+The same Secret serves all three credential consumers (pack pull, evidence
+publish, validator pulls — see "Private validator images"). Create the
+distribution **before** labeling clusters into the fleet, or order two
+MultiClusterServices with `dependsOn`; a missing publish secret otherwise
+yields a green Job with no published evidence. Enterprise secret
+stores: External Secrets Operator on the children fills the same role;
+the chart needs nothing special.
 
 ### Private validator images
 
@@ -87,7 +110,7 @@ A pack's validator catalog may reference private images. Those are pulled by the
 validateFlags: "--namespace aicr --image-pull-secret acme-registry-cred"
 ```
 
-With `--namespace` set to the release namespace, the *same* dockerconfigjson Secret used for `dataPackSecret` can serve as the validator pull secret — one robot token, one Secret object, all three consumers (pack pull, evidence push, validator pull). The stock validators and the snapshot agent (`ghcr.io/nvidia/aicr`) are public and need none of this.
+With `--namespace` set to the release namespace, the *same* dockerconfigjson Secret used for `dataPackSecret` can serve as the validator pull secret — one robot token, one Secret object, all three consumers (pack pull, evidence push, validator pull). That `--namespace` is the load-bearing part: without it the validator Jobs run in `aicr-validation`, where the Secret does not exist. The stock validators and the snapshot agent (`ghcr.io/nvidia/aicr`) are public and need none of this. Note that the one-Secret story is about `dataPackSecret`: `dataPackAuth` creates a pack-pull Secret only, and `validate.publish.registrySecret` / `--image-pull-secret` still need a Secret you supply.
 
 ## Which criteria?
 
@@ -116,12 +139,13 @@ The chart refuses to render with no criteria at all: state an `accelerator`, or 
 | `service` | `any` | Service overlay: `aks`, `bcm`, `eks`, `gke`, `kind`, `lke`, `metal3`, `ocp`, `oke`, a pack-registered value (e.g. `acme`), or `any` for self-managed clusters |
 | `dataPack` | `""` | OCI reference (no scheme) of your org's `--data` extension pack |
 | `dataPackSecret` | `""` | Existing dockerconfigjson Secret for private pack registries |
+| `dataPackAuth.dockerconfigjson` | `""` | Opt-in: raw dockerconfigjson content; the chart creates `<release>-pack-auth` and uses it for the pack pull. Mutually exclusive with `dataPackSecret`. For reconcilers with native secret-to-values injection (Flux `valuesFrom`, kcm MCS `serviceSpec.services[].valuesFrom`); see "Private pack registries" for the exposure trade-off |
 | `dataPackPlainHTTP` / `dataPackInsecureTLS` | `false` | Pack-pull transport for lab registries (plain HTTP / untrusted TLS) — production registries need neither |
 | `orasImage` | `ghcr.io/oras-project/oras:v1.2.0` | initContainer image that pulls `dataPack` |
 | `recipeConfigMap` | `aicr-recipe` | ConfigMap receiving the resolved recipe + summary; `""` disables |
-| `aicrVersion` | `v0.18.0` | Pinned [aicr release](https://github.com/NVIDIA/aicr/releases) tag |
+| `aicrVersion` | `v0.20.0` | Pinned [aicr release](https://github.com/NVIDIA/aicr/releases) tag |
 | `aicrArch` | `amd64` | Binary architecture: `amd64` or `arm64` |
-| `aicrSha256` | `{amd64: <v0.18.0 hash>, arm64: ""}` | Strict pin keyed by architecture; the entry matching `aicrArch` is used. Update on every `aicrVersion` bump. See "Supply-chain verification" |
+| `aicrSha256` | `{amd64: <v0.20.0 hash>, arm64: <v0.20.0 hash>}` | Strict pin keyed by architecture; the entry matching `aicrArch` is used. Update on every `aicrVersion` bump. See "Supply-chain verification" |
 | `validate.enabled` | `false` | Run `aicr validate` after the install; see "Validation" |
 | `validate.phases` | `[deployment]` | Validation phases to run |
 | `validate.failOnError` | `false` | When `true`, a failed validation fails the Job — always after the verdict is captured |
@@ -194,7 +218,7 @@ spec:
   chart:
     spec:
       chart: nvidia-aicr
-      version: 0.1.0
+      version: 0.2.0
       sourceRef: {kind: HelmRepository, name: nvidia-aicr, namespace: flux-system}
   values:
     service: acme
@@ -222,7 +246,7 @@ spec:
       gpu-fleet: training            # your label on GPU ClusterDeployments
   serviceSpec:
     services:
-      - template: nvidia-aicr-0-1-0
+      - template: nvidia-aicr-0-2-0
         name: nvidia-aicr
         namespace: nvidia-aicr
         values: |
@@ -240,6 +264,8 @@ spec:
             emitEvidence: true
             publish: {enabled: true, mode: unsigned, ref: ghcr.io/acme/aicr-evidence}
 ```
+
+`dataPackSecret` must exist on each child before the Job runs — see "Landing the Secret on fleet children".
 
 ## Tainted GPU nodes
 
@@ -276,12 +302,12 @@ environment:
 
 - **`k0sContainerd`** points the container-toolkit at k0s's containerd (`/run/k0s/containerd.sock`, drop-ins under `/etc/k0s/containerd.d/`). Without it the toolkit configures the *default* containerd, reports success, and GPU pods then fail with `no runtime for "nvidia" is configured`.
 
-- **`preinstalledDriver`** turns the GPU operator's driver install off and points the DRA driver at the host root. aicr's driver-ownership coherence check requires both, so the toggle sets both together.
+- **`preinstalledDriver`** turns the GPU operator's driver install off and points the DRA driver at the host root. aicr's driver-ownership coherence check requires both; aicr >= v0.19 additionally requires the NVSentinel labeler to be told the driver is host-provided, so the toggle sets all three together.
 
 The toggles are applied before `bundleFlags`, so you can still override any of it. The equivalent long form:
 
 ```yaml
-bundleFlags: '--set gpuoperator:driver.enabled=false --set dradriver:nvidiaDriverRoot=/ --set-json gpuoperator:toolkit.env=[{"name":"CONTAINERD_CONFIG","value":"/etc/k0s/containerd.d/nvidia.toml"},{"name":"CONTAINERD_SOCKET","value":"/run/k0s/containerd.sock"},{"name":"CONTAINERD_RUNTIME_CLASS","value":"nvidia"}]'
+bundleFlags: '--set gpuoperator:driver.enabled=false --set dradriver:nvidiaDriverRoot=/ --set nv-sentinel:labeler.assumeDriverInstalled=true --set-json gpuoperator:toolkit.env=[{"name":"CONTAINERD_CONFIG","value":"/etc/k0s/containerd.d/nvidia.toml"},{"name":"CONTAINERD_SOCKET","value":"/run/k0s/containerd.sock"},{"name":"CONTAINERD_RUNTIME_CLASS","value":"nvidia"}]'
 ```
 
 Verified end to end on 8× H200 SXM bare metal (k0s v1.36.2, kcm 1.9.0): all components installed under strict flags and aicr's deployment phase passed 4/4.
@@ -325,6 +351,13 @@ With `deploy.enabled: false` the Job still pulls the pack and resolves + capture
 
 The Job downloads the pinned release tarball and verifies its sha256 against the release's `aicr_checksums.txt` before executing anything (fail-closed). For stricter provenance, set `aicrSha256.<arch>` to the expected tarball hash: that anchors trust in reviewed chart values rather than in release assets fetched at runtime. An empty entry skips only this extra pin — the checksums-file verification always runs.
 
+Before executing `deploy.sh`, the Job runs `aicr verify` on the rendered
+bundle — upstream's closed-world gate: every file is checked against the
+bundle's `checksums.txt`, and any addition, removal, or modification fails
+the Job. In-Job bundles are unattested, so this verifies integrity, not
+provenance (and external `--data` packs cap upstream's trust level at
+`attested` regardless).
+
 The Job pod runs as nonroot (UID 65532, matching upstream's own image user) with a read-only root filesystem; all work happens in an `emptyDir` mounted at `/tmp`.
 
 ## RBAC
@@ -337,7 +370,13 @@ The Job's ServiceAccount is bound to `cluster-admin`. AICR bundles install clust
 
 - On clusters without GPUs (kind included), GPU-dependent pods stay Pending and `--best-effort` keeps the install going. That is what the k0rdent catalog's kind e2e exercises: the delivery mechanics, not GPU functionality.
 
-- **Component-failure detection is the chart's, not deploy.sh's.** At aicr v0.18.0, `deploy.sh` reports component failures but never exits non-zero for them (with or without `--best-effort`). The Job therefore detects the failure report itself: without `--best-effort`, component failures fail the Job; with `--best-effort`, they are logged and the Job succeeds — partial installs can never masquerade as silent success.
+- **Component-failure detection is belt-and-braces.** aicr v0.20.0's
+  `deploy.sh` exits non-zero on component failure when `--best-effort` is
+  absent (v0.18.0 never did); with `--best-effort` it always exits 0 and
+  reports. The Job fails on any non-zero deploy exit **and** independently
+  detects the failure report: without `--best-effort`, component failures
+  fail the Job; with it, they are logged and the Job succeeds — partial
+  installs can never masquerade as silent success on either version.
 
 - **Air-gapped clusters are not supported by this chart version.** The Job downloads the `aicr` binary from GitHub releases and the bundle pulls charts from upstream registries. AICR itself supports air-gapped delivery (`aicr bundle --vendor-charts`, the air-gap mirror workflow, a CycloneDX SBOM per deployable image); exposing it here needs a mirrored binary source and registry overrides. Planned for a future chart version.
 

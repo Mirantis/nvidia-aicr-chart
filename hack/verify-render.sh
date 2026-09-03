@@ -78,6 +78,27 @@ rejects_raw() {
   else pass "$desc"; fi
 }
 
+# rejects_with <needle> <description> [helm --set args...]
+#
+# For guards whose VALUE is the error message, not the rejection. Some inputs
+# fail the render with or without the guard — a malformed value blows up on
+# Go's own "can't evaluate field X in type string" the moment a template
+# dereferences it. Plain `rejects` passes in both cases, so it asserts nothing
+# about the guard and is vacuous by construction (house rule 1). Matching the
+# message is what proves the friendly `fail` is the thing that fired.
+rejects_with() {
+  local needle="$1" desc="$2"; shift 2
+  local out
+  if out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>&1); then
+    fail "$desc — render succeeded but should have been rejected"
+    return
+  fi
+  case "$out" in
+    *"$needle"*) pass "$desc" ;;
+    *)           fail "$desc — rejected, but not with '$needle': $(printf '%s' "$out" | tail -1)" ;;
+  esac
+}
+
 # contains / omits <needle> <description> [helm --set args...]
 #
 # The render is captured and matched with `case`, never piped into `grep -q`:
@@ -103,6 +124,30 @@ omits() {
     *"$needle"*) fail "$desc — output unexpectedly contains '$needle'" ;;
     *)           pass "$desc" ;;
   esac
+}
+
+# pack_auth_name_matches <description> [helm --set args...]
+#
+# The chart-managed Secret's own metadata.name and the name the Job's volume
+# mounts must be the same string. Both come from nvidia-aicr.packSecretName so
+# they cannot drift — this asserts they in fact don't. Nothing else in the
+# suite would: `contains 'secretName: "t-pack-auth"'` reads only the mount
+# side, so spelling the Secret's name out separately renders perfectly valid
+# YAML and ships a Job mounting a Secret that does not exist — no render-time
+# signal, just a pod wedged in ContainerCreating on the target cluster.
+pack_auth_name_matches() {
+  local desc="$1"; shift
+  local out created mounted
+  if ! out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null); then
+    fail "$desc — render FAILED"; return
+  fi
+  created=$(printf '%s\n' "$out" | awk '/^kind: Secret$/{s=1} s && /^  name: /{print $2; exit}')
+  mounted=$(printf '%s\n' "$out" | awk -F'"' '/secretName: /{print $2; exit}')
+  if [ -n "$created" ] && [ "$created" = "$mounted" ]; then
+    pass "$desc (both \"$created\")"
+  else
+    fail "$desc — Secret created as \"$created\" but Job mounts \"$mounted\""
+  fi
 }
 
 PUBLISH_ON=(--set validate.enabled=true --set validate.emitEvidence=true
@@ -142,6 +187,36 @@ contains 'registry-config' "dataPackSecret wires --registry-config into oras" \
   --set dataPack=ghcr.io/example/pack:1.0.0 --set dataPackSecret=pack-pull
 contains 'secretName: "pack-pull"' "dataPackSecret mounts the named Secret" \
   --set dataPack=ghcr.io/example/pack:1.0.0 --set dataPackSecret=pack-pull
+contains 'type: kubernetes.io/dockerconfigjson' \
+  "dataPackAuth renders the chart-managed pull Secret" \
+  --set dataPack=ghcr.io/acme/pack:1 --set-json 'dataPackAuth={"dockerconfigjson":"{\"auths\":{}}"}'
+contains 'secretName: "t-pack-auth"' \
+  "dataPackAuth mounts the chart-managed Secret" \
+  --set dataPack=ghcr.io/acme/pack:1 --set-json 'dataPackAuth={"dockerconfigjson":"{\"auths\":{}}"}'
+# Mounting the Secret is not the same as USING it: --registry-config is what
+# makes oras authenticate. dataPackSecret has this assertion above; without the
+# twin, the dataPackAuth branch of the same shared `if $packSecret` could
+# regress to an anonymous pull with the Secret sitting mounted and unread.
+contains 'registry-config' \
+  "dataPackAuth wires --registry-config into oras" \
+  --set dataPack=ghcr.io/acme/pack:1 --set-json 'dataPackAuth={"dockerconfigjson":"{\"auths\":{}}"}'
+contains 'mountPath: /pack-auth' \
+  "dataPackAuth mounts /pack-auth into the oras initContainer" \
+  --set dataPack=ghcr.io/acme/pack:1 --set-json 'dataPackAuth={"dockerconfigjson":"{\"auths\":{}}"}'
+pack_auth_name_matches \
+  "the chart-managed Secret's name is the name the Job mounts" \
+  --set dataPack=ghcr.io/acme/pack:1 --set-json 'dataPackAuth={"dockerconfigjson":"{\"auths\":{}}"}'
+rejects_with 'dataPackAuth must be a map' \
+  "a scalar dataPackAuth is rejected with a shape error, not a raw Go field error" \
+  --set dataPack=ghcr.io/acme/pack:1 --set dataPackAuth=oops
+omits 'type: kubernetes.io/dockerconfigjson' \
+  "no chart-managed Secret by default" \
+  --set dataPack=ghcr.io/acme/pack:1
+rejects "dataPackSecret and dataPackAuth are mutually exclusive" \
+  --set dataPack=ghcr.io/acme/pack:1 --set dataPackSecret=pack-pull \
+  --set-json 'dataPackAuth={"dockerconfigjson":"{\"auths\":{}}"}'
+rejects "dataPackAuth without dataPack is rejected (no consumer for the Secret)" \
+  --set-json 'dataPackAuth={"dockerconfigjson":"{\"auths\":{}}"}'
 omits   '"--plain-http"' "pack pull is HTTPS by default" \
   --set dataPack=ghcr.io/example/pack:1.0.0
 contains '"--plain-http"' "dataPackPlainHTTP adds --plain-http to oras" \
@@ -213,15 +288,42 @@ env_is ENV_K0S_CONTAINERD    true  "k0sContainerd=true is wired through" \
   --set environment.k0sContainerd=true
 env_is ENV_PREINSTALLED_DRIVER true "preinstalledDriver=true is wired through" \
   --set environment.preinstalledDriver=true
+# Template-text assertion, deliberately with NO --set: the PROFILE_ARGS block
+# is shell inside the always-rendered command script, so this needle is present
+# whatever environment.preinstalledDriver is — passing `--set
+# environment.preinstalledDriver=true` here would imply a conditionality this
+# assertion does not test (see the file header: strings in the always-rendered
+# script pass regardless of --set). The value wiring is covered by the
+# ENV_PREINSTALLED_DRIVER pair above; what THIS catches is the aicr >= v0.19
+# coherence flag being dropped from the profile.
+contains 'nv-sentinel:labeler.assumeDriverInstalled=true' \
+  "preinstalled-driver profile carries the nvsentinel labeler flag"
 env_is ENV_K0S_CONTAINERD true "truthy non-boolean (1) normalises to \"true\"" \
   --set environment.k0sContainerd=1
 
 echo "== aicr binary pin =="
-env_is AICR_SHA256 "6a498b8ce0dcb0e28095de35cdae583391ad567f3922aae6657c851cc76275ee" \
-  "amd64 strict pin is applied by default"
-env_is AICR_SHA256 "" "arm64 does not inherit the amd64 pin" --set aicrArch=arm64
+env_is AICR_SHA256 "a80a7ed1ad7474434c929efbea77223b0eb156f901569319698e9bdb9e1126f9" \
+  "amd64 strict pin is applied by default"   # v0.20.0 linux_amd64
+env_is AICR_SHA256 "f8353a56ff430714818879c8b4c4de057c0e3cea11beb34f45e4753db8f300f5" \
+  "aicrArch=arm64 selects the arm64 strict pin" --set aicrArch=arm64
+# Now that BOTH arches ship a pin, the "no entry for this arch" path has no
+# other coverage — and that is the path where a `get`/lookup regression would
+# silently check a tarball against another architecture's hash instead of
+# skipping the optional pin. Empty the selected entry explicitly.
+env_is AICR_SHA256 "" \
+  "an arch with an empty pin entry gets no strict pin (never inherits another arch's)" \
+  --set aicrArch=arm64 --set aicrSha256.arm64=""
 rejects "legacy scalar aicrSha256 is rejected with a migration error" \
   --set aicrSha256=deadbeef
+
+echo "== bundle -> deploy gate =="
+# Closed-world gate between bundle and deploy — upstream's canonical flow
+# (`aicr verify . && ./deploy.sh`). Template-text assertion: catches the
+# gate being dropped. Verified 2026-09-01 on v0.20.0: unattested bundle
+# passes at trust level "unverified" (checksums only, offline); a tampered
+# deploy.sh fails with exit 4. Command exists on v0.18.0 too.
+contains './aicr verify ./bundles' \
+  "bundle passes the aicr verify gate before deploy.sh runs"
 
 echo "== example values files =="
 for ex in "$CHART"/examples/*.yaml; do
