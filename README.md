@@ -21,7 +21,7 @@ The chart is one Kubernetes Job plus its ServiceAccount and RBAC. On the target 
 
 AICR is consumed unmodified — no wrapper logic, no duplicated behavior — so component versions and install ordering always come from the pinned upstream release.
 
-> **v0.2.0 is experimental.** It targets connected clusters. The install path is the proven core; data packs, validation, and evidence publishing are opt-in values, default off.
+> **v0.3.0 is experimental.** It targets connected clusters. The install path is the proven core; data packs, validation, and evidence publishing are opt-in values, default off.
 
 ## Install
 
@@ -29,10 +29,28 @@ There is no default accelerator — state your criteria (see ["Which criteria?"]
 
 ```bash
 helm install nvidia-aicr oci://ghcr.io/mirantis/charts/nvidia-aicr \
-  --version 0.2.0 \
+  --version 0.3.0 \
   --namespace nvidia-aicr --create-namespace \
   --set accelerator=h100
 ```
+
+> **Upgrading from 0.2.0?** Do these in order (details in "k0s clusters" and
+> the "Upgrading a cluster converged on an earlier pin" bullet under
+> [Scope and limitations](#scope-and-limitations)):
+>
+> 1. Republish org packs with `apiVersion: aicr.run/v1beta1` first. This is
+>    safe while still on chart 0.2.0, because aicr v0.20.0 reads v1beta1
+>    (verified 2026-10-22; re-verify with `.tmp/aicr-0.20.0 recipe --data
+>    hack/e2e/acme-aicr-pack --service acme --accelerator h100 --intent
+>    training -o /dev/null`).
+> 2. Replace `environment.k0sContainerd` with `service: k0s` (Kubernetes >= 1.34).
+> 3. Replace `service: self-managed`/`self`/`vanilla` with `service: any`.
+> 4. Before re-running over a converged cluster, run `aicr upgrade-check
+>    --from cluster --to <recipe> --deployer helm`. gpu-operator, nvsentinel
+>    and nvidia-dra-driver-gpu currently report blocked.
+>
+> A k0rdent MCS template bump (`nvidia-aicr-0-3-0`) rolls an install Job to
+> every matched cluster, so step 4 applies per cluster.
 
 Watch it converge, then check what actually resolved:
 
@@ -97,17 +115,26 @@ apply` on the mothership. Worked example with ordering caveats:
 The same Secret serves all three credential consumers (pack pull, evidence
 publish, validator pulls — see "Private validator images"). Create the
 distribution **before** labeling clusters into the fleet, or order two
-MultiClusterServices with `dependsOn`; a missing publish secret otherwise
-yields a green Job with no published evidence. Enterprise secret
+MultiClusterServices with `dependsOn`. If `validate.publish.registrySecret`
+names a Secret that has not landed yet, the Job's pod cannot start (the
+Secret is a required volume), so nothing runs until the Secret lands or
+`job.activeDeadlineSeconds` expires; the Job is never green. If
+publish is enabled with no `registrySecret` at all, the push is anonymous, a
+private registry rejects it, and with `validate.publish.failOnError: false`
+(the default) the Job still goes green with no published evidence. Enterprise secret
 stores: External Secrets Operator on the children fills the same role;
 the chart needs nothing special.
 
 ### Private validator images
 
-A pack's validator catalog may reference private images. Those are pulled by the **kubelet** in the namespace where `aicr validate` runs its validator Jobs (default `aicr-validation`) — `dataPackSecret` does not cover them. aicr exposes the knobs natively; pass them through `validateFlags`:
+A pack's validator catalog may reference private images. Those are pulled by the **kubelet** in the namespace where `aicr validate` runs its validator Jobs (default `aicr-validation`) — `dataPackSecret` does not cover them. aicr exposes the knobs natively; pass them through `validateArgs`:
 
 ```yaml
-validateFlags: "--namespace aicr --image-pull-secret acme-registry-cred"
+validateArgs:
+  - --namespace
+  - nvidia-aicr    # the release namespace
+  - --image-pull-secret
+  - acme-registry-cred
 ```
 
 With `--namespace` set to the release namespace, the *same* dockerconfigjson Secret used for `dataPackSecret` can serve as the validator pull secret — one robot token, one Secret object, all three consumers (pack pull, evidence push, validator pull). That `--namespace` is the load-bearing part: without it the validator Jobs run in `aicr-validation`, where the Secret does not exist. The stock validators and the snapshot agent (`ghcr.io/nvidia/aicr`) are public and need none of this. Note that the one-Secret story is about `dataPackSecret`: `dataPackAuth` creates a pack-pull Secret only, and `validate.publish.registrySecret` / `--image-pull-secret` still need a Secret you supply.
@@ -116,8 +143,8 @@ With `--namespace` set to the release namespace, the *same* dockerconfigjson Sec
 
 Recipe selection is criteria assembly against AICR's catalog (`service`, `accelerator`, `intent`, `os`, `platform`). Two failure modes matter:
 
-- **Over-specification fails hard**: naming a dimension the matching overlays don't declare is rejected outright (e.g. `intent: training` with `service: any`). The error message lists supported combinations — but you only see it in the Job log, minutes after `helm install` returned.
-- **Under-specification degrades silently**: fewer stated dimensions resolve a *thinner* stack with exit 0 and no warning. `accelerator: a100` alone resolves 11 components; a fully-specified EKS training leaf resolves 15.
+- **Over-specification fails hard**: naming a dimension the matching overlays don't declare is rejected outright (e.g. `intent: training` with `service: any`: a stated intent needs a service that declares it, and at v1.2.0 those are `aks`, `bcm`, `eks`, `k0s`, `kind`, `lke`, `ocp`, `rke2`, `cks` with `os: ubuntu`, `gke` with `os: cos`, and `oke` with `os: ol`; verified 2026-11-05). The error message lists supported combinations — but you only see it in the Job log, minutes after `helm install` returned.
+- **Under-specification degrades silently**: fewer stated dimensions resolve a *thinner* stack with exit 0 and no warning. `accelerator: a100` alone resolves 12 components; a fully-specified EKS training leaf (`--service eks --accelerator h100 --intent training --os ubuntu`) resolves 15 (aicr v1.2.0, verified 2026-11-05).
 
 Defend against both:
 
@@ -126,26 +153,26 @@ aicr recipe list --gpu h200        # before: which combinations exist for your G
 kubectl get cm aicr-recipe -n <ns> -o jsonpath='{.data.summary\.txt}'   # after: what resolved
 ```
 
-The chart refuses to render with no criteria at all: state an `accelerator`, or set `dataPack` (your pack owns criteria), or state a concrete `service` plus `intent` (accelerator-less leaves like `bcm`+`inference` exist; `service: any` does not count). Extra flags (`--nodes`, `--criteria-strict`) pass through `recipeFlags`.
+The chart refuses to render with no criteria at all: state an `accelerator`, or set `dataPack` (your pack owns criteria), or state a concrete `service` plus `intent` (accelerator-less leaves like `bcm`+`inference` exist; `service: any` does not count). Extra arguments (`--nodes`, `--criteria-strict`) pass through `recipeArgs`.
 
 ## Values
 
 | Key | Default | Meaning |
 |---|---|---|
-| `accelerator` | `""` **(required*)** | Target accelerator: `h100`, `h200`, `gb200`, `gb300`, `b200`, `a100`, `l40`, `l40s`, `rtx-pro-6000`. *Render fails unless this, `dataPack`, or concrete `service`+`intent` is set |
-| `intent` | `""` | Recipe intent (`training`, `inference`). **Empty omits the flag.** A stated intent must be declared by the matching overlays — see "Which criteria?" |
-| `os` | `""` | Node OS (`ubuntu`, `rhel`, `cos`, `amazonlinux`, `ol`, `talos`). **Empty omits the flag** |
-| `platform` | `""` | Workload platform (`kubeflow`, `dynamo`, `nim`, `runai`, `slurm`). **Empty omits the flag** |
-| `service` | `any` | Service overlay: `aks`, `bcm`, `eks`, `gke`, `kind`, `lke`, `metal3`, `ocp`, `oke`, a pack-registered value (e.g. `acme`), or `any` for self-managed clusters |
+| `accelerator` | `""` **(required*)** | Target accelerator: `h100`, `h200`, `gb200`, `gb300`, `b200`, `b300`, `a100`, `l40`, `l40s`, `rtx-pro-6000`, `vr200`. *Render fails unless this, `dataPack`, or concrete `service`+`intent` is set |
+| `intent` | `""` | Recipe intent (`training`, `inference`). **Empty omits the flag.** A stated intent must be declared by the matching overlays, so it needs a service that provides it (not `any`) — see "Which criteria?" |
+| `os` | `""` | Node OS (`ubuntu`, `rhel`, `rocky`, `cos`, `amazonlinux`, `ol`, `sles`, `talos`). **Empty omits the flag** |
+| `platform` | `""` | Workload platform (`kubeflow`, `dynamo`, `kueue`, `nim`, `runai`, `slurm`). **Empty omits the flag** |
+| `service` | `any` | Service overlay: `aks`, `bcm`, `cks`, `eks`, `generic`, `gke`, `k0s`, `kind`, `lke`, `metal3`, `mk8s`, `nvke`, `ocp`, `oke`, `rke2`, a pack-registered value (e.g. `acme`), or `any` for self-managed clusters. `generic` and `metal3` are accepted by the CLI but have no recipe for most accelerators (e.g. `--service metal3 --accelerator h100` exits 2 with `no recipe provides service`; v1.2.0, verified 2026-11-05). Use `any`, not `self-managed`/`self`/`vanilla`: at v1.2.0 those names map to `generic`, which has no recipe for most accelerators (see "k0s clusters" and the CHANGELOG). Use `k0s` on k0s clusters |
 | `dataPack` | `""` | OCI reference (no scheme) of your org's `--data` extension pack |
 | `dataPackSecret` | `""` | Existing dockerconfigjson Secret for private pack registries |
 | `dataPackAuth.dockerconfigjson` | `""` | Opt-in: raw dockerconfigjson content; the chart creates `<release>-pack-auth` and uses it for the pack pull. Mutually exclusive with `dataPackSecret`. For reconcilers with native secret-to-values injection (Flux `valuesFrom`, kcm MCS `serviceSpec.services[].valuesFrom`); see "Private pack registries" for the exposure trade-off |
 | `dataPackPlainHTTP` / `dataPackInsecureTLS` | `false` | Pack-pull transport for lab registries (plain HTTP / untrusted TLS) — production registries need neither |
-| `orasImage` | `ghcr.io/oras-project/oras:v1.2.0` | initContainer image that pulls `dataPack` |
+| `orasImage` | `ghcr.io/oras-project/oras:v1.2.0@sha256:0087224dd0decc354b5b0689068fbbc40cd5dc3dbf65fcb3868dfbd363dc790b` | initContainer image that pulls `dataPack`; pinned to the multi-arch index covering linux/amd64 and linux/arm64 |
 | `recipeConfigMap` | `aicr-recipe` | ConfigMap receiving the resolved recipe + summary; `""` disables |
-| `aicrVersion` | `v0.20.0` | Pinned [aicr release](https://github.com/NVIDIA/aicr/releases) tag |
+| `aicrVersion` | `v1.2.0` | Pinned [aicr release](https://github.com/NVIDIA/aicr/releases) tag |
 | `aicrArch` | `amd64` | Binary architecture: `amd64` or `arm64` |
-| `aicrSha256` | `{amd64: <v0.20.0 hash>, arm64: <v0.20.0 hash>}` | Strict pin keyed by architecture; the entry matching `aicrArch` is used. Update on every `aicrVersion` bump. See "Supply-chain verification" |
+| `aicrSha256` | `{amd64: <v1.2.0 hash>, arm64: <v1.2.0 hash>}` | Strict pin keyed by architecture; the entry matching `aicrArch` is used. Update on every `aicrVersion` bump. See "Supply-chain verification" |
 | `validate.enabled` | `false` | Run `aicr validate` after the install; see "Validation" |
 | `validate.phases` | `[deployment]` | Validation phases to run |
 | `validate.failOnError` | `false` | When `true`, a failed validation fails the Job — always after the verdict is captured |
@@ -160,18 +187,27 @@ The chart refuses to render with no criteria at all: state an `accelerator`, or 
 | `validate.publish.failOnError` | `false` | A publish failure fails the Job only when `true` |
 | `validate.publish.insecureTLS` / `.plainHTTP` | `false` | Self-signed / plain-HTTP registries (local testing) |
 | `storageClass` | `""` | If non-empty, passed to `aicr bundle --storage-class` |
-| `recipeFlags` | `""` | Extra flags passed to `aicr recipe` (e.g. `--criteria-strict`, `--nodes 8`) |
-| `bundleFlags` | `""` | Extra flags passed to `aicr bundle` — see "Tainted GPU nodes". Applied after `environment.*`, so these win |
-| `validateFlags` | `""` | Extra flags passed to `aicr validate` (`--namespace`, `--image-pull-secret`, `--node-selector`); see "Private validator images" |
+| `recipeArgs` | `[]` | **Recommended:** arguments passed to `aicr recipe`; one list element is one complete argument, preserving spaces, apostrophes and glob characters. Quote every element, including numbers and booleans. Appended after `recipeFlags` |
+| `recipeFlags` | `""` | Legacy extra flags for `aicr recipe`. Split on whitespace; no shell quoting is interpreted, and matching glob patterns expand. Use `recipeArgs` when an argument needs whitespace, quotes or a literal `*` |
+| `bundleArgs` | `[]` | **Recommended:** arguments passed to `aicr bundle`, after `bundleFlags`; one list element is one complete argument. Quote every element, including numbers and booleans. Applied after `environment.*`, so operator values win |
+| `bundleFlags` | `""` | Legacy extra flags for `aicr bundle` — see "Tainted GPU nodes". Split on whitespace; no shell quoting is interpreted, and matching glob patterns expand |
+| `validateArgs` | `[]` | **Recommended:** arguments passed to `aicr validate`, after `validateFlags`; one list element is one complete argument. Quote every element, including numbers and booleans. See "Private validator images" |
+| `validateFlags` | `""` | Legacy extra flags for `aicr validate` (`--namespace`, `--image-pull-secret`, `--node-selector`). Split on whitespace; no shell quoting is interpreted, and matching glob patterns expand |
 | `job.extraEnv` | `[]` | Extra env for the installer container, verbatim (e.g. `AICR_NCCL_FABRIC`) |
-| `environment.k0sContainerd` | `false` | Point the container-toolkit at k0s's own containerd — prefer encoding this in your org pack; see "k0s clusters" |
-| `environment.preinstalledDriver` | `false` | Nodes already carry an NVIDIA driver — prefer encoding this in your org pack |
+| `environment.preinstalledDriver` | `false` | Nodes already carry an NVIDIA driver — prefer encoding this in your org pack. `service: k0s` does **not** imply it; see "k0s clusters" |
 | `deploy.enabled` | `true` | `false` = assert-only run: skip bundle+deploy entirely and validate the cluster against the resolved recipe. Requires `validate.enabled`; see "Validation postures" |
-| `deployFlags` | `--best-effort --no-wait` | Flags passed to the bundle's `deploy.sh` (accepts `--best-effort`, `--no-wait`, `--retries N`) |
-| `runtimeImage` | `alpine/k8s:1.34.0` | Job image; must include `bash`, `curl`, `kubectl`, and `helm` |
+| `deployArgs` | `[]` | **Recommended:** arguments passed to the bundle's `deploy.sh`, after `deployFlags`; one list element is one complete argument, preserving spaces, apostrophes and glob characters. Quote every element, including numbers and booleans. The non-empty legacy default still applies; set `deployFlags: ""` for list-only arguments |
+| `deployFlags` | `--best-effort --no-wait` | Legacy flags for `deploy.sh` (accepts `--best-effort`, `--no-wait`, `--retries N`). Split on whitespace; no shell quoting is interpreted, and matching glob patterns expand. Use `deployArgs` for structured arguments |
+| `runtimeImage` | `alpine/k8s:1.34.0@sha256:b5f6edfeac5279f3e182d938d1ffecb62f7c980756ac4b6b66d7f0d566782f77` | Job image; pinned to the multi-arch index covering linux/amd64 and linux/arm64. Must include `bash`, `curl`, `kubectl`, and `helm` |
 | `job.*` | see `values.yaml` | Job backoff, TTL, deadline, and resource settings |
 | `job.tolerations` | `[]` | Tolerations for the **installer pod itself** — required on clusters whose only workers are tainted GPU nodes; see "Tainted GPU nodes" |
 | `job.nodeSelector` / `job.affinity` / `job.priorityClassName` | empty | Remaining scheduling controls for the installer pod |
+
+Structured argument rendering, literal space/apostrophe/glob handling, and
+placement after each legacy string were exercised by `hack/verify-render.sh`
+with Helm v4.3.0 and bash 5.3.20(1)-release, verified 2026-11-05. The image
+index digests were resolved with Docker 29.9.2 and curl 8.7.1 on the same date;
+CONTRIBUTING's release checklist refreshes them.
 
 ## Publishing evidence
 
@@ -218,7 +254,7 @@ spec:
   chart:
     spec:
       chart: nvidia-aicr
-      version: 0.2.0
+      version: 0.3.0
       sourceRef: {kind: HelmRepository, name: nvidia-aicr, namespace: flux-system}
   values:
     service: acme
@@ -246,7 +282,7 @@ spec:
       gpu-fleet: training            # your label on GPU ClusterDeployments
   serviceSpec:
     services:
-      - template: nvidia-aicr-0-2-0
+      - template: nvidia-aicr-0-3-0
         name: nvidia-aicr
         namespace: nvidia-aicr
         values: |
@@ -255,29 +291,34 @@ spec:
           service: acme
           accelerator: h200
           intent: training
-          bundleFlags: "--accelerated-node-toleration nvidia.com/gpu=present:NoSchedule"
-          deployFlags: "--retries 1"     # strict: wait and gate on the verdict
+          bundleArgs:
+            - --accelerated-node-toleration
+            - nvidia.com/gpu=present:NoSchedule
+          deployFlags: ""                 # replace the legacy default with list-only args
+          deployArgs: [--retries, "1"]   # strict: wait and gate on the verdict
           validate:
             enabled: true
             phases: [deployment]
             failOnError: true
             emitEvidence: true
-            publish: {enabled: true, mode: unsigned, ref: ghcr.io/acme/aicr-evidence}
+            publish: {enabled: true, mode: unsigned, ref: ghcr.io/acme/aicr-evidence, registrySecret: aicr-pack-pull}
 ```
 
 `dataPackSecret` must exist on each child before the Job runs — see "Landing the Secret on fleet children".
 
 ## Tainted GPU nodes
 
-Production clusters commonly taint GPU nodes (e.g. `nvidia.com/gpu=present:NoSchedule`). AICR injects tolerations into the rendered charts when asked; pass the flags through `bundleFlags`:
+Production clusters commonly taint GPU nodes (e.g. `nvidia.com/gpu=present:NoSchedule`). AICR injects tolerations into the rendered charts when asked; pass the arguments through `bundleArgs`:
 
 ```yaml
-bundleFlags: "--accelerated-node-toleration nvidia.com/gpu=present:NoSchedule"
+bundleArgs:
+  - --accelerated-node-toleration
+  - nvidia.com/gpu=present:NoSchedule
 ```
 
 Without this, GPU-targeted components stay `Pending` on tainted nodes. Related scheduling flags (`--system-node-selector`, `--system-node-toleration`, `--workload-gate`, `--set component:path=value`) pass through the same way.
 
-**`bundleFlags` covers the components AICR deploys — not the installer Job itself.** On a cluster whose only worker pool is tainted, the Job's own pod will never schedule, and it burns the full `activeDeadlineSeconds` (3 h by default) before failing with `DeadlineExceeded`. Tolerate the taint for the installer too:
+**`bundleArgs` covers the components AICR deploys — not the installer Job itself.** On a cluster whose only worker pool is tainted, the Job's own pod will never schedule, and it burns the full `activeDeadlineSeconds` (3 h by default) before failing with `DeadlineExceeded`. Tolerate the taint for the installer too:
 
 ```yaml
 job:
@@ -292,25 +333,74 @@ Note that aicr's `--set` is **scalar-only**; list or object values need `--set-j
 
 ## k0s clusters and hosts with a preinstalled driver
 
-These two toggles encode environment facts. If you run an org pack, encode them in the pack's overlay instead — that is what packs are for, and it keeps per-cluster values empty:
+**On k0s, set `service: k0s`.** Upstream AICR accepts it as a criteria value from v0.22.0 (aicr v0.20.0 rejects it with `invalid service type: k0s`; verified 2026-10-22). On v1.2.0 (verified 2026-11-05, from the overlays at tag v1.2.0, unchanged from v1.1.2, and `aicr recipe`), upstream's `k0s` overlay sets two things and nothing else:
+
+- the GPU operator toolkit's containerd environment (`CONTAINERD_CONFIG=/etc/k0s/containerd.d/nvidia.toml`, `CONTAINERD_SOCKET=/run/k0s/containerd.sock`, `CONTAINERD_RUNTIME_CLASS=nvidia`). Without it the toolkit configures the *default* containerd, reports success, and GPU pods then fail with `no runtime for "nvidia" is configured`;
+- the constraint `K8s.server.version >= 1.34`.
+
+The `k0s-training` overlay adds only the `training` intent. **`service: k0s` does not imply a preinstalled driver.** The driver facts (GPU operator `driver.enabled: false` and `migManager.enabled: false`, DRA driver `nvidiaDriverRoot: /`, NVSentinel `labeler.assumeDriverInstalled: true` and the janitor's `hostDriverRootPath: /`) and the `OS.release.ID=ubuntu`, `VERSION_ID=24.04` constraints live only in upstream's `h200-k0s-ubuntu-training` leaf, which resolves for `accelerator: h200`, `intent: training`, `os: ubuntu`:
 
 ```yaml
+service: k0s
+accelerator: h200
+intent: training
+os: ubuntu          # selects the validated h200-k0s-ubuntu-training leaf
+```
+
+Without `os`, `--service k0s --accelerator h200` resolves the generic k0s stack (12 components, no driver facts), and `--service k0s --accelerator h200 --intent training` fails with `specify os (valid: ubuntu)` unless an org pack supplies the leaf. On k0s with a host driver and no such leaf, you still need `environment.preinstalledDriver: true` (or the equivalent in your pack):
+
+```yaml
+service: k0s
+accelerator: h100
 environment:
-  k0sContainerd: true        # cluster runs k0s (its own containerd)
   preinstalledDriver: true   # nodes already carry an NVIDIA driver
 ```
 
-- **`k0sContainerd`** points the container-toolkit at k0s's containerd (`/run/k0s/containerd.sock`, drop-ins under `/etc/k0s/containerd.d/`). Without it the toolkit configures the *default* containerd, reports success, and GPU pods then fail with `no runtime for "nvidia" is configured`.
+**`environment.k0sContainerd` was removed in chart 0.3.0** (breaking). Any value other than `false` (or absent/null) fails the render, including the quoted string `"false"` (verified 2026-10-22 with `--set-string`), and the message says what to do instead (it contains `environment.k0sContainerd was removed in chart 0.3.0`). `service: k0s` is the exact replacement. Two floors apply: `service: k0s` needs aicr >= v0.22.0, so overriding `aicrVersion` below that fails in aicr with `invalid service type: k0s`; and the overlay requires Kubernetes >= 1.34.
 
-- **`preinstalledDriver`** turns the GPU operator's driver install off and points the DRA driver at the host root. aicr's driver-ownership coherence check requires both; aicr >= v0.19 additionally requires the NVSentinel labeler to be told the driver is host-provided, so the toggle sets all three together.
+**`preinstalledDriver`** stays for every service with a host driver, k0s or not. It turns the GPU operator's driver install off and points the DRA driver at the host root; aicr's driver-ownership coherence check requires both, and `aicr bundle` also fails closed unless the NVSentinel labeler is told the driver is host-provided, so the toggle sets all three together. It is applied before `bundleFlags` and `bundleArgs`, so you can still override any of it. Its structured long form (preferred):
 
-The toggles are applied before `bundleFlags`, so you can still override any of it. The equivalent long form:
+```yaml
+bundleArgs:
+  - --set
+  - gpuoperator:driver.enabled=false
+  - --set
+  - dradriver:nvidiaDriverRoot=/
+  - --set
+  - nv-sentinel:labeler.assumeDriverInstalled=true
+```
+
+The legacy string equivalent is whitespace-split and does not interpret shell quoting:
+
+```yaml
+bundleFlags: '--set gpuoperator:driver.enabled=false --set dradriver:nvidiaDriverRoot=/ --set nv-sentinel:labeler.assumeDriverInstalled=true'
+```
+
+**Org pack with its own `service` value.** If your pack registers a private service (so `service: k0s` is not an option), the k0s containerd wiring is yours to carry. The cleaner home is the pack's overlay (the `toolkit.env` override under the `gpu-operator` component). The escape hatch without a pack change is `bundleArgs`; the full structured long form, including the list-valued `toolkit.env` (aicr's `--set` is scalar-only, hence `--set-json`):
+
+```yaml
+bundleArgs:
+  - --set
+  - gpuoperator:driver.enabled=false
+  - --set
+  - dradriver:nvidiaDriverRoot=/
+  - --set
+  - nv-sentinel:labeler.assumeDriverInstalled=true
+  - --set-json
+  - 'gpuoperator:toolkit.env=[{"name": "CONTAINERD_CONFIG", "value": "/etc/k0s/containerd.d/nvidia.toml"}, {"name": "CONTAINERD_SOCKET", "value": "/run/k0s/containerd.sock"}, {"name": "CONTAINERD_RUNTIME_CLASS", "value": "nvidia"}]'
+```
+
+Unlike the legacy form, the JSON argument can contain spaces and the inner double quotes are passed through unchanged (the chart's array rendering was checked with Helm v4.3.0 and this exact JSON bundled successfully with aicr v1.2.0, verified 2026-11-05). The legacy string form requires whitespace-free JSON because it is split on whitespace and performs no quote removal:
 
 ```yaml
 bundleFlags: '--set gpuoperator:driver.enabled=false --set dradriver:nvidiaDriverRoot=/ --set nv-sentinel:labeler.assumeDriverInstalled=true --set-json gpuoperator:toolkit.env=[{"name":"CONTAINERD_CONFIG","value":"/etc/k0s/containerd.d/nvidia.toml"},{"name":"CONTAINERD_SOCKET","value":"/run/k0s/containerd.sock"},{"name":"CONTAINERD_RUNTIME_CLASS","value":"nvidia"}]'
 ```
 
-Verified end to end on 8× H200 SXM bare metal (k0s v1.36.2, kcm 1.9.0): all components installed under strict flags and aicr's deployment phase passed 4/4.
+[`packs/k0s-h200-training`](packs/k0s-h200-training/) is an illustrative worked example of an org pack: it layers on upstream's `service: k0s` overlays and carries one example fleet's facts as overrides. Copy it and change the facts to match your own fleet; it is not a product service.
+
+**Self-managed clusters: use `service: any`.** Earlier docs recommended the names `self-managed`, `self` and `vanilla`. At v1.2.0 those aliases resolve to `generic`, not `any`, and `generic` has no recipe for most accelerators (`aicr recipe --service self-managed --accelerator h100` exits 2 with `no recipe provides service 'generic'`; verified 2026-11-05). The chart does not guard against this at render time, so the failure shows up in the Job log.
+
+The chart's k0s path was verified end to end on 8× H200 SXM bare metal (k0s v1.36.2, kcm 1.9.0) with aicr v0.20.0 in 2026-08: all components installed under strict flags and aicr's deployment phase passed 4/4. That run used the removed `environment.k0sContainerd` toggle; the `service: k0s` path has been checked offline only (recipe resolution against the v1.1.2 binary on 2026-10-22 and the v1.2.0 binary on 2026-11-05), not on hardware.
 
 ## Validation
 
@@ -334,7 +424,7 @@ Operational notes: when validation is enabled, drop `--no-wait` from `deployFlag
 
 Two different things get verified with the same machinery. **Rollout verification** (the `deployment` phase, validators shipped in aicr) asks *"is the cluster running what the recipe says?"*. **Capability qualification** (the `performance`/`conformance` phases, validators mostly from your org pack) asks *"does this hardware actually deliver?"* — burn-in, NCCL floors, storage thresholds. Qualification consumes what rollout installed (DCGM, device plugin, drivers); it never provides it.
 
-`aicr validate` itself never deploys anything — it is purely assertive. The chart's `deploy.enabled` toggle and `validate.phases` therefore span four postures (worked values in [`examples/`](examples/)):
+`aicr validate` installs or upgrades no recipe component. It does create short-lived objects of its own: each validator runs as a Kubernetes Job and, without `--snapshot`, a snapshot agent captures the cluster first (both in `--namespace`, with per-run RBAC that is removed at the end unless `--no-cleanup`; aicr v1.2.0 `validate --help`, 2026-11-05). Performance validators may also start their own benchmark workloads. The chart's `deploy.enabled` toggle and `validate.phases` therefore span four postures (worked values in [`examples/`](examples/)):
 
 | Posture | `deploy.enabled` | `phases` | When |
 |---|---|---|---|
@@ -366,17 +456,32 @@ The Job's ServiceAccount is bound to `cluster-admin`. AICR bundles install clust
 
 ## Scope and limitations
 
+- **Kubernetes 1.32 is the chart-wide minimum** (`kubeVersion: ">= 1.32.0-0"`, enforced by Helm at template/lint time; Helm v4.3.0, verified 2026-11-05). The pinned default criteria resolve `K8s.server.version >= 1.32` (`.tmp/aicr-1.2.0 recipe --service any --accelerator h100`; aicr v1.2.0, verified 2026-11-05). Recipe-specific floors can be stricter: `service: k0s` requires **Kubernetes >= 1.34**, as its resolved constraint states. Other recipes may impose their own constraints, so check the recipe rather than treating 1.32 as sufficient for every target.
+
 - Evidence bundles published in `signed` mode place the identity token in the install pod (see "Publishing evidence"); `unsigned` mode exists precisely so identity never has to enter the cluster.
 
 - On clusters without GPUs (kind included), GPU-dependent pods stay Pending and `--best-effort` keeps the install going. That is what the k0rdent catalog's kind e2e exercises: the delivery mechanics, not GPU functionality.
 
-- **Component-failure detection is belt-and-braces.** aicr v0.20.0's
-  `deploy.sh` exits non-zero on component failure when `--best-effort` is
-  absent (v0.18.0 never did); with `--best-effort` it always exits 0 and
-  reports. The Job fails on any non-zero deploy exit **and** independently
-  detects the failure report: without `--best-effort`, component failures
-  fail the Job; with it, they are logged and the Job succeeds — partial
-  installs can never masquerade as silent success on either version.
+- **Component-failure detection is belt-and-braces.** aicr v1.2.0's
+  `deploy.sh` (same logic as v1.1.2's; read from a generated bundle,
+  2026-11-05) exits 1 on a component failure when `--best-effort` is absent;
+  with `--best-effort` it continues past failed components, prints
+  `Deployment completed with failures (--best-effort):` and exits 0; and it
+  exits 2 when every component installed but the DRA kubelet-plugin restart
+  was deferred because the GPU operator's driver migration had not settled
+  (if a component also failed, it exits 1). The Job fails on any non-zero
+  deploy exit **and** independently detects the failure report: without
+  `--best-effort`, component failures fail the Job; with it, they are logged
+  and the Job succeeds. Exit 2 is the exception under `--best-effort`: the Job
+  logs `WARN: deploy.sh deferred the DRA kubelet-plugin restart (exit 2)` and
+  continues to validation, only when deploy.sh's own line `DRA kubelet plugin
+  restart blocked, retry needed for:` is in the log and no failure report is
+  (any other exit 2 stays fatal). To finish, let the operator converge and
+  re-run the install (`helm upgrade` creates a fresh Job, which re-runs
+  `deploy.sh`). Without `--best-effort`, exit 2 fails the Job. Partial
+  installs cannot masquerade as silent success either way.
+
+- **Upgrading a cluster converged on an earlier pin is not a plain re-run.** A fresh install is unaffected. Re-running chart 0.3.0 over a cluster that chart 0.2.0 (aicr v0.20.0) converged crosses component boundaries that upstream's `aicr upgrade-check` currently reports as blocked. Indicative result for `service: any` + `h100`, v0.20.0 to v1.2.0 (run 2026-11-05 with the v1.2.0 binary; v1.2.0's `upgrade-check` refuses a v0.20.0-generated recipe file, `aicr.run/v1alpha2 was retired in v1.0.0`, so this used that recipe with its header rewritten to `aicr.run/v1`, which is not an upstream-supported input): gpu-operator v26.3.3 to v26.7.2 **blocked** ("stops at =26.7.1"; "no record describes an upgrade starting from v26.3.3. The earliest recorded starting point is 26.7.0, and no record assesses the move from v26.3.3 to it"); nvsentinel v1.20.0 to v1.28.0 **blocked** ("stops at 1.25.0"; "The earliest recorded starting point is 1.22.0"); nvidia-dra-driver-gpu 0.4.1 to 0.5.1 **blocked** ("stops at 0.5.1"; "The earliest recorded starting point is 0.5.0"); for each of the three upstream says "Read the component's upstream release notes for that move before applying it, then re-run this check". nodewright-operator v0.17.1 to v0.20.0 **manual**, with a namespace relocation `skyhook -> nodewright` that no record assesses; nfd 0.19.0 to 0.20.1 **manual** (3 steps, of which the two RBAC steps, widen-nrt-rbac and narrow-nrt-rbac, apply "only when your nfd override sets topologyUpdater.rbac.create=false"; upgrade-nfd always applies; "chart-managed RBAC (AICR's default) needs nothing"); kai-scheduler v0.14.1 to v0.16.9 **unknown** ("breaking boundary"). A cluster converged on an unreleased v1.1.2 build of this chart sees only nfd 0.19.0 to 0.20.1 **manual** (with chart-managed RBAC, only the upgrade itself, which re-running the chart performs) and nvidia-dra-driver-gpu 0.5.0 to 0.5.1 **safe** (`upgrade-check` from a v1.1.2 recipe to the v1.2.0 one, 2026-11-05). The bundle's `UPGRADING.md` is not enough on its own: it covers only the boundary the bundle's pinned version lands in, not earlier ones you cross. **Required first step:** from a workstation with cluster access, run `aicr upgrade-check --from cluster --to <recipe> --deployer helm` (`--from cluster` is the only supported source for a cluster converged on the old pin) and treat its verdict as authoritative; for a blocked component, first bring it to the earliest recorded starting point the check names, following that component's upstream release notes, then re-run the check, and re-run the chart only once nothing is blocked. The chart does not run `upgrade-check` for you.
 
 - **Air-gapped clusters are not supported by this chart version.** The Job downloads the `aicr` binary from GitHub releases and the bundle pulls charts from upstream registries. AICR itself supports air-gapped delivery (`aicr bundle --vendor-charts`, the air-gap mirror workflow, a CycloneDX SBOM per deployable image); exposing it here needs a mirrored binary source and registry overrides. Planned for a future chart version.
 

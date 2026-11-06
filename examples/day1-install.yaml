@@ -7,6 +7,7 @@ accelerator: h200
 intent: training
 dataPack: "ghcr.io/acme/acme-aicr-pack:1.0.0"
 dataPackSecret: "aicr-pack-pull"
+deployFlags: "--retries 1"     # strict: wait and gate on the verdict
 
 validate:
   enabled: true

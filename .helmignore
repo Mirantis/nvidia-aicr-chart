@@ -10,3 +10,6 @@ CONTRIBUTING.md
 SECURITY.md
 *.tgz
 .tmp/
+packs/
+.superpowers/
+.DS_Store

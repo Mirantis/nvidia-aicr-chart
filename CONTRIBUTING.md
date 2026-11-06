@@ -6,9 +6,11 @@ you have the right to contribute the code under that license.
 
 ## Dev loop
 
+Prerequisites: Helm, bash, and `python3` with PyYAML (`python3 -m pip install pyyaml`).
+
 ```bash
-helm lint . --strict --set accelerator=h100
-./hack/verify-render.sh .          # ~60 render assertions, seconds
+helm lint . --strict --set accelerator=h100 --kube-version 1.34.0
+./hack/verify-render.sh .          # 97 render assertions, seconds (Helm v4.3.0, verified 2026-11-05)
 ```
 
 Both run in CI on every push (`lint` workflow) and again at release time —
@@ -51,10 +53,17 @@ GitHub Actions runner.
 
 1. Bump `version` in `Chart.yaml` (semver; breaking values changes bump the
    minor pre-1.0). Update `CHANGELOG.md`.
-2. If bumping `appVersion`: update `aicrSha256.amd64` from the release's
-   `aicr_checksums.txt`, and re-verify any behaviour claims against the new
-   binary (see house rule 2).
-3. Tag `vX.Y.Z` and push the tag. The release workflow verifies
+2. If bumping `appVersion`: update both `aicrSha256.amd64` and
+   `aicrSha256.arm64` from the release's `aicr_checksums.txt`, and re-verify
+   any behaviour claims against the new binary (see house rule 2).
+3. Refresh the `runtimeImage` and `orasImage` multi-arch index digests (and
+   their tags when intentionally upgrading). Resolve each tag through its
+   registry API, use the response's `Docker-Content-Digest`, and confirm the
+   response body hashes to that value and contains linux/amd64 + linux/arm64;
+   `docker manifest inspect <ref>` shows the platform entries but the individual
+   platform digests are NOT the index digest (Docker 29.9.2 and curl 8.7.1,
+   verified 2026-11-05). Update `values.yaml` and the README values table.
+4. Tag `vX.Y.Z` and push the tag. The release workflow verifies
    tag == `Chart.yaml` version, re-runs lint + render assertions, refuses to
    overwrite an already-published version, and pushes to
    `oci://ghcr.io/<owner>/charts`.

@@ -6,7 +6,7 @@
 # renders default values only, which exercises none of them.
 #
 # Assertions check rendered VALUES, not the presence of a string anywhere in
-# the output: strings like "aicr validate" and "ENV_K0S_CONTAINERD" live in the
+# the output: strings like "aicr validate" and "ENV_PREINSTALLED_DRIVER" live in the
 # always-rendered shell script and env block, so grepping for them passes
 # regardless of what --set does.
 #
@@ -17,7 +17,12 @@
 # Usage: hack/verify-render.sh [chart-dir]
 set -euo pipefail
 
+# CI uses ubuntu-latest; its system python3 is assumed to carry PyYAML (not
+# independently verified from runner image documentation).
+python3 -c 'import yaml' 2>/dev/null || { echo "verify-render.sh needs python3 with PyYAML (pip install pyyaml)"; exit 2; }
+
 CHART="${1:-.}"
+KUBE_VERSION="${KUBE_VERSION:-1.34.0}"
 RC=0
 BASE=(--set accelerator=h100)
 
@@ -37,7 +42,7 @@ fail() { printf '  FAIL  %s\n' "$1" >&2; RC=1; }
 env_is() {
   local var="$1" want="$2" desc="$3"; shift 3
   local out line got
-  if ! out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null); then
+  if ! out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>/dev/null); then
     fail "$desc — render FAILED (env_is needs a successful render)"
     return
   fi
@@ -55,12 +60,12 @@ env_is() {
 # renders / rejects — BASE criteria included
 renders() {
   local desc="$1"; shift
-  if helm template t "$CHART" "${BASE[@]}" "$@" >/dev/null 2>&1; then pass "$desc"
+  if helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" >/dev/null 2>&1; then pass "$desc"
   else fail "$desc — render failed"; fi
 }
 rejects() {
   local desc="$1"; shift
-  if helm template t "$CHART" "${BASE[@]}" "$@" >/dev/null 2>&1; then
+  if helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" >/dev/null 2>&1; then
     fail "$desc — render succeeded but should have been rejected"
   else pass "$desc"; fi
 }
@@ -68,12 +73,12 @@ rejects() {
 # renders_raw / rejects_raw — NO base criteria; exactly the stated flags
 renders_raw() {
   local desc="$1"; shift
-  if helm template t "$CHART" "$@" >/dev/null 2>&1; then pass "$desc"
+  if helm template t "$CHART" --kube-version "$KUBE_VERSION" "$@" >/dev/null 2>&1; then pass "$desc"
   else fail "$desc — render failed"; fi
 }
 rejects_raw() {
   local desc="$1"; shift
-  if helm template t "$CHART" "$@" >/dev/null 2>&1; then
+  if helm template t "$CHART" --kube-version "$KUBE_VERSION" "$@" >/dev/null 2>&1; then
     fail "$desc — render succeeded but should have been rejected"
   else pass "$desc"; fi
 }
@@ -89,7 +94,7 @@ rejects_raw() {
 rejects_with() {
   local needle="$1" desc="$2"; shift 2
   local out
-  if out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>&1); then
+  if out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>&1); then
     fail "$desc — render succeeded but should have been rejected"
     return
   fi
@@ -107,19 +112,47 @@ rejects_with() {
 # It only bites when the needle appears early in output large enough that the
 # producer is still writing — i.e. it would start flaking silently as the
 # chart grows. (Demonstrated in the kind e2e; fixed here pre-emptively.)
+# helm's exit status is checked first, as in env_is: a failed render yields an
+# empty string, which made `omits` pass vacuously (e.g. `--set environment=null`
+# errored and still printed ok).
 contains() {
   local needle="$1" desc="$2"; shift 2
   local out
-  out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null || true)
+  if ! out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>/dev/null); then
+    fail "$desc — render FAILED (contains needs a successful render)"
+    return
+  fi
   case "$out" in
     *"$needle"*) pass "$desc" ;;
     *)           fail "$desc — expected output to contain '$needle'" ;;
   esac
 }
+
+# contains_line <needle> <description> [helm --set args...]
+# Exact whole-line match after removing YAML indentation. This anchors template
+# text assertions without treating regex metacharacters in shell code specially.
+contains_line() {
+  local needle="$1" desc="$2"; shift 2
+  local out line found=1
+  if ! out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>/dev/null); then
+    fail "$desc — render FAILED (contains_line needs a successful render)"
+    return
+  fi
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    if [ "$line" = "$needle" ]; then found=0; break; fi
+  done <<< "$out"
+  if [ "$found" -eq 0 ]; then pass "$desc"
+  else fail "$desc — expected an exact rendered line containing '$needle'"; fi
+}
+
 omits() {
   local needle="$1" desc="$2"; shift 2
   local out
-  out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null || true)
+  if ! out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>/dev/null); then
+    fail "$desc — render FAILED (omits needs a successful render)"
+    return
+  fi
   case "$out" in
     *"$needle"*) fail "$desc — output unexpectedly contains '$needle'" ;;
     *)           pass "$desc" ;;
@@ -138,7 +171,7 @@ omits() {
 pack_auth_name_matches() {
   local desc="$1"; shift
   local out created mounted
-  if ! out=$(helm template t "$CHART" "${BASE[@]}" "$@" 2>/dev/null); then
+  if ! out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>/dev/null); then
     fail "$desc — render FAILED"; return
   fi
   created=$(printf '%s\n' "$out" | awk '/^kind: Secret$/{s=1} s && /^  name: /{print $2; exit}')
@@ -150,11 +183,112 @@ pack_auth_name_matches() {
   fi
 }
 
+# privileged_images_pinned <description> [helm --set args...]
+# Both privileged images must be immutable multi-arch index pins. Parse the
+# rendered Job rather than hard-coding a digest, so a release-checklist refresh
+# does not require a test-only constant change.
+privileged_images_pinned() {
+  local desc="$1"; shift
+  local out images
+  if ! out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>/dev/null); then
+    fail "$desc — render FAILED"; return
+  fi
+  if images=$(printf '%s\n' "$out" | python3 -c '
+import sys, yaml
+jobs = [d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind") == "Job"]
+if len(jobs) != 1:
+    raise SystemExit(f"expected one Job, got {len(jobs)}")
+pod = jobs[0]["spec"]["template"]["spec"]
+containers = pod.get("initContainers", []) + pod.get("containers", [])
+images = {c.get("name"): c.get("image", "") for c in containers}
+names = ("aicr", "data-pack")
+missing = "<ABSENT>"
+bad = [f"{name}={images.get(name, missing)}"
+       for name in names if "@sha256:" not in images.get(name, "")]
+if bad:
+    raise SystemExit("; ".join(bad))
+print(", ".join(f"{name}: digest pinned" for name in names))
+' 2>&1); then
+    pass "$desc ($images)"
+  else
+    fail "$desc — $images"
+  fi
+}
+
+# deploy_args_behavior <description> [helm --set args...]
+# Execute the rendered deploy snippet with a fake deploy.sh. This proves the
+# array path preserves spaces, apostrophes, newlines and a literal glob, comes
+# after the legacy word-split string, and still recognises --best-effort for exit 2.
+deploy_args_behavior() {
+  local desc="$1"; shift
+  local out work rc actual arguments expected
+  if ! out=$(helm template t "$CHART" --kube-version "$KUBE_VERSION" "${BASE[@]}" "$@" 2>/dev/null); then
+    fail "$desc — render FAILED"; return
+  fi
+  work=$(mktemp -d)
+  printf '%s\n' "$out" > "$work/rendered.yaml"
+  sed -n '/^ *echo "=== Running deploy.sh ==="$/,/^ *echo "=== AICR install complete ==="$/p' \
+    "$work/rendered.yaml" | sed 's/^              //' > "$work/snippet.sh"
+  mkdir "$work/bundles"
+  : > "$work/bundles/glob-must-not-expand"
+  cat > "$work/bundles/deploy.sh" <<'FAKE'
+printf '<%s>\n' "$@" > "${ARG_LOG:?}"
+echo "All components installed successfully."
+if [ "${FAKE_RETRY:-0}" = 1 ]; then
+  echo "DRA kubelet plugin restart blocked, retry needed for: nvidia-dra-driver-gpu"
+fi
+exit "${FAKE_RC:-0}"
+FAKE
+  expected=$(cat <<'EXPECTED'
+<legacy-one>
+<legacy-two>
+<--best-effort>
+<space value>
+<quote'value>
+<*>
+<line1
+line2>
+EXPECTED
+)
+  rc=0
+  actual=$(cd "$work" && ARG_LOG="$work/arguments" DEPLOY_FLAGS="legacy-one legacy-two" \
+    FAKE_RC=0 bash -c 'set -euo pipefail; source "$1"; echo "=== CONTINUED ==="' \
+    _ "$work/snippet.sh" 2>&1) || rc=$?
+  arguments=$(cat "$work/arguments" 2>/dev/null || true)
+  if [ "$rc" -ne 0 ] || [ "$arguments" != "$expected" ]; then
+    fail "$desc — argument run exit=$rc, expected $(printf '%q' "$expected"), got $(printf '%q' "$arguments"); $(printf '%s' "$actual" | tail -1)"
+    rm -rf "$work"
+    return
+  fi
+  rc=0
+  actual=$(cd "$work" && ARG_LOG="$work/arguments" DEPLOY_FLAGS="legacy-one legacy-two" \
+    FAKE_RC=2 FAKE_RETRY=1 bash -c 'set -euo pipefail; source "$1"; echo "=== CONTINUED ==="' \
+    _ "$work/snippet.sh" 2>&1) || rc=$?
+  case "$actual" in
+    *"WARN: deploy.sh deferred the DRA kubelet-plugin restart (exit 2)"*"=== CONTINUED ==="*) ;;
+    *) rc=99 ;;
+  esac
+  rm -rf "$work"
+  if [ "$rc" -eq 0 ]; then pass "$desc"
+  else fail "$desc — exit-2 run did not continue through deployArgs --best-effort: $(printf '%s' "$actual" | tail -1)"; fi
+}
+
 PUBLISH_ON=(--set validate.enabled=true --set validate.emitEvidence=true
             --set validate.publish.enabled=true
             --set validate.publish.ref=ghcr.io/example/aicr-evidence)
 SIGNED=("${PUBLISH_ON[@]}" --set validate.publish.identityTokenSecret.name=cosign-token-secret)
 UNSIGNED=("${PUBLISH_ON[@]}" --set validate.publish.mode=unsigned)
+
+echo "== Kubernetes floor =="
+# Exact Helm error verified with Helm v4.3.0 and v3.19.0 on 2026-11-05.
+rejects_with 'chart requires kubeVersion: >= 1.32.0-0 which is incompatible with Kubernetes v1.31.0' \
+  "Kubernetes 1.31 is rejected by Helm's kubeVersion check (below the chart floor)" \
+  --kube-version 1.31.0
+if helm template t "$CHART" --kube-version 1.32.0 --set accelerator=h100 >/dev/null 2>&1; then
+  pass "Kubernetes 1.32 is accepted (the chart floor)"
+else
+  fail "Kubernetes 1.32 is accepted (the chart floor) — render failed"
+fi
 
 echo "== criteria guard =="
 rejects_raw "bare defaults are rejected (no accelerator, no pack)"
@@ -168,9 +302,11 @@ rejects_raw "intent with service=any does not escape the guard" --set intent=tra
 # "any" is the absence of a value: aicr rejects --accelerator any outright.
 rejects_raw "accelerator=any is rejected (aicr treats it as no criteria)" \
   --set accelerator=any
-# values.yaml documents self-managed/self/vanilla as aliases of any.
+# self-managed/self/vanilla: aliases of any up to aicr v0.20.0, of `generic`
+# at v1.2.0 (verified 2026-11-05); without an accelerator aicr rejects them +
+# intent either way.
 for alias in self-managed self vanilla; do
-  rejects_raw "service=$alias (alias of any) + intent does not escape the guard" \
+  rejects_raw "service=$alias (legacy alias of any) + intent does not escape the guard" \
     --set service="$alias" --set intent=training
 done
 
@@ -225,10 +361,58 @@ contains '"--insecure"' "dataPackInsecureTLS adds --insecure to oras" \
   --set dataPack=ghcr.io/example/pack:1.0.0 --set dataPackInsecureTLS=true
 contains 'name: pack-tmp' "oras initContainer gets a writable /tmp (blob staging)" \
   --set dataPack=ghcr.io/example/pack:1.0.0
+privileged_images_pinned "runtime and pack-pull images are digest pinned" \
+  --set dataPack=ghcr.io/example/pack:1.0.0
+
+echo "== structured passthrough args =="
+contains "RECIPE_VALUE_ARGS=( '--set-json' 'component:path=two words' )" \
+  "recipeArgs preserves a space inside one array element" \
+  --set 'recipeArgs[0]=--set-json' --set 'recipeArgs[1]=component:path=two words'
+contains "BUNDLE_VALUE_ARGS=( '--set-json' 'it'\\''s *' )" \
+  "bundleArgs escapes an apostrophe and renders a glob literally" \
+  --set 'bundleArgs[0]=--set-json' --set "bundleArgs[1]=it's *"
+contains "VALIDATE_VALUE_ARGS=( '--namespace' 'team blue' '--label' '*' )" \
+  "validateArgs preserves spaces and a literal glob" \
+  --set 'validateArgs[0]=--namespace' --set 'validateArgs[1]=team blue' \
+  --set 'validateArgs[2]=--label' --set 'validateArgs[3]=*'
+# shellcheck disable=SC2016  # literal rendered bash; must not expand locally
+contains './aicr recipe "${RECIPE_ARGS[@]}" "${DATA_ARGS[@]}" ${RECIPE_FLAGS} "${RECIPE_VALUE_ARGS[@]}"' \
+  "recipeArgs follow the unchanged legacy recipeFlags"
+# shellcheck disable=SC2016  # literal rendered bash; must not expand locally
+contains './aicr bundle "${BUNDLE_ARGS[@]}" "${DATA_ARGS[@]}" "${PROFILE_ARGS[@]}" ${BUNDLE_FLAGS} "${BUNDLE_VALUE_ARGS[@]}"' \
+  "bundleArgs follow the unchanged legacy bundleFlags"
+# shellcheck disable=SC2016  # literal rendered bash; must not expand locally
+contains '( cd ./bundles && bash ./deploy.sh ${DEPLOY_FLAGS} "${DEPLOY_VALUE_ARGS[@]}" )' \
+  "deployArgs follow the unchanged legacy deployFlags"
+# shellcheck disable=SC2016  # literal rendered bash; must not expand locally
+contains '--output ./ctrf.json ${VALIDATE_FLAGS} "${VALIDATE_VALUE_ARGS[@]}" || rc=$?' \
+  "validateArgs follow the unchanged legacy validateFlags"
+env_is RECIPE_FLAGS "--criteria-strict --nodes 8" \
+  "legacy recipeFlags reach the Job unchanged" \
+  --set recipeFlags="--criteria-strict --nodes 8"
+env_is BUNDLE_FLAGS "--vendor-charts --set x=y" \
+  "legacy bundleFlags reach the Job unchanged" \
+  --set bundleFlags="--vendor-charts --set x=y"
+env_is DEPLOY_FLAGS "--best-effort --retries 2" \
+  "legacy deployFlags reach the Job unchanged" \
+  --set deployFlags="--best-effort --retries 2"
+deploy_args_behavior \
+  "deployArgs survive execution literally and enable --best-effort" \
+  --set 'deployArgs[0]=--best-effort' --set 'deployArgs[1]=space value' \
+  --set "deployArgs[2]=quote'value" --set 'deployArgs[3]=*' \
+  --set $'deployArgs[4]=line1\nline2'
+rejects_with 'recipeArgs must be a YAML list of strings' \
+  "scalar recipeArgs is rejected with a friendly type error" \
+  --set recipeArgs=--best-effort
+rejects_with 'recipeArgs[0] must be a string; quote every element, including numbers' \
+  "numeric recipeArgs element is rejected and tells the user to quote numbers" \
+  --set 'recipeArgs[0]=100000000'
 
 echo "== recipe visibility =="
 env_is RECIPE_CM "aicr-recipe" "recipe capture on by default"
 env_is RECIPE_CM "" "recipeConfigMap=\"\" disables capture" --set recipeConfigMap=""
+contains_line "[ \${#RECIPE_VALUE_ARGS[@]} -gt 0 ] && printf 'recipeArgs:%s\\n' \"\$(printf ' %q' \"\${RECIPE_VALUE_ARGS[@]}\")\"" \
+  "non-empty recipeArgs are recorded in the advisory recipe summary"
 
 echo "== validation =="
 env_is VALIDATE_ENABLED false "validation off by default"
@@ -282,10 +466,22 @@ rejects "signed mode without identityTokenSecret.name is rejected" \
   "${PUBLISH_ON[@]}"
 
 echo "== environment profile =="
-env_is ENV_K0S_CONTAINERD    false "k0s profile off by default"
-env_is ENV_PREINSTALLED_DRIVER false "preinstalled-driver profile off by default"
-env_is ENV_K0S_CONTAINERD    true  "k0sContainerd=true is wired through" \
+# environment.k0sContainerd was removed in chart 0.3.0 (upstream ships
+# `service: k0s` from aicr v0.22.0, verified 2026-10-22). A truthy value must
+# fail the render with the migration message, never be silently ignored;
+# rejects_with matches the message so the assertion proves the guard fired,
+# not some other failure.
+rejects_with 'environment.k0sContainerd was removed in chart 0.3.0' \
+  "environment.k0sContainerd=true is rejected with a migration error" \
   --set environment.k0sContainerd=true
+rejects_with 'or pass it with bundleArgs: ["--set-json", "gpuoperator:toolkit.env=[...]"] (each list element is one argument, so the JSON may contain spaces). The legacy bundleFlags' \
+  "truthy non-boolean k0sContainerd (1) is rejected with structured and legacy migration paths" \
+  --set environment.k0sContainerd=1
+renders "environment.k0sContainerd=false is tolerated (means not using it)" \
+  --set environment.k0sContainerd=false
+omits 'ENV_K0S_CONTAINERD' "the k0s env var is gone"
+omits '/run/k0s/containerd.sock' "the chart no longer injects k0s containerd paths"
+env_is ENV_PREINSTALLED_DRIVER false "preinstalled-driver profile off by default"
 env_is ENV_PREINSTALLED_DRIVER true "preinstalledDriver=true is wired through" \
   --set environment.preinstalledDriver=true
 # Template-text assertion, deliberately with NO --set: the PROFILE_ARGS block
@@ -298,13 +494,11 @@ env_is ENV_PREINSTALLED_DRIVER true "preinstalledDriver=true is wired through" \
 # coherence flag being dropped from the profile.
 contains 'nv-sentinel:labeler.assumeDriverInstalled=true' \
   "preinstalled-driver profile carries the nvsentinel labeler flag"
-env_is ENV_K0S_CONTAINERD true "truthy non-boolean (1) normalises to \"true\"" \
-  --set environment.k0sContainerd=1
 
 echo "== aicr binary pin =="
-env_is AICR_SHA256 "a80a7ed1ad7474434c929efbea77223b0eb156f901569319698e9bdb9e1126f9" \
-  "amd64 strict pin is applied by default"   # v0.20.0 linux_amd64
-env_is AICR_SHA256 "f8353a56ff430714818879c8b4c4de057c0e3cea11beb34f45e4753db8f300f5" \
+env_is AICR_SHA256 "3ff6935fd7988373903a2a30f1c24a74a5f8a9052a310615db19fcfec4cfe9a2" \
+  "amd64 strict pin is applied by default"   # v1.2.0 linux_amd64
+env_is AICR_SHA256 "26824146cd0743229239899cb75d3b68e0bc262bcdb357fccc98eca0a5b75976" \
   "aicrArch=arm64 selects the arm64 strict pin" --set aicrArch=arm64
 # Now that BOTH arches ship a pin, the "no entry for this arch" path has no
 # other coverage — and that is the path where a `get`/lookup regression would
@@ -319,15 +513,38 @@ rejects "legacy scalar aicrSha256 is rejected with a migration error" \
 echo "== bundle -> deploy gate =="
 # Closed-world gate between bundle and deploy — upstream's canonical flow
 # (`aicr verify . && ./deploy.sh`). Template-text assertion: catches the
-# gate being dropped. Verified 2026-09-01 on v0.20.0: unattested bundle
+# gate being dropped. v1.2.0, verified 2026-11-05: an unattested bundle
 # passes at trust level "unverified" (checksums only, offline); a tampered
-# deploy.sh fails with exit 4. Command exists on v0.18.0 too.
+# deploy.sh fails with exit 4.
 contains './aicr verify ./bundles' \
   "bundle passes the aicr verify gate before deploy.sh runs"
+# deploy.sh exit 2 (v1.2.0, verified 2026-11-05; same logic as v1.1.2's):
+# every component installed, DRA kubelet-plugin restart deferred. Under
+# --best-effort the Job warns and continues; the branch must key on
+# deploy.sh's own retry line, not on the exit code alone, so an unrelated
+# exit 2 still fails the Job. Template-text assertions, like
+# the verify gate above: they catch the key or the log line being dropped.
+# Branch behaviour itself is proven by a scratch harness (task-2 report).
+contains 'DRA kubelet plugin restart blocked, retry needed for:' \
+  "exit-2 warn branch keys on deploy.sh's own retry line"
+contains 'WARN: deploy.sh deferred the DRA kubelet-plugin restart (exit 2)' \
+  "exit-2 warn branch logs the deferred restart"
+# The other two terms of the warn condition, anchored on text that only the
+# condition contains (a bare 'Deployment completed with failures' would also
+# match the later report-line check, so it would be vacuous):
+# shellcheck disable=SC2016  # literal template text; must not expand
+contains '[ "${rc}" -eq 2 ] && [ "${DEPLOY_BEST_EFFORT}" = "true" ]' \
+  "exit-2 warn branch requires --best-effort"
+contains '&& ! grep -q "Deployment completed with failures" ./deploy.log; then' \
+  "exit-2 warn branch is refused when deploy.sh reported component failures"
+# Fail branch: any exit 2 that does not meet all three terms fails the Job
+# and says why.
+contains 'exit 2 continues only as a deferred DRA kubelet-plugin restart' \
+  "exit-2 fail branch explains why an exit 2 was not let through"
 
 echo "== example values files =="
 for ex in "$CHART"/examples/*.yaml; do
-  if helm template t "$CHART" -f "$ex" >/dev/null 2>&1; then
+  if helm template t "$CHART" --kube-version "$KUBE_VERSION" -f "$ex" >/dev/null 2>&1; then
     pass "example renders: $(basename "$ex")"
   else
     fail "example does not render: $(basename "$ex")"

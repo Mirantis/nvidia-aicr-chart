@@ -1,53 +1,77 @@
-# A named recipe for NVIDIA training on bare-metal Kubernetes running k0s.
+# An illustrative org --data pack: a named recipe for NVIDIA training on
+# bare-metal Kubernetes running k0s with H200 GPUs.
 #
-# WHY THIS PACK EXISTS: upstream AICR has no service value for on-prem /
-# bare-metal Kubernetes. Its only non-cloud overlay is `kind`, which assumes
-# the host has BOTH the driver and the container toolkit pre-configured
-# (nvkind does that) and disables both plus DCGM. A real bare-metal box is
-# the mirror image: the driver IS installed, the toolkit is NOT, and the GPUs
-# are real so DCGM should stay on. `intent: training` additionally requires a
-# concrete service upstream — of {aks,bcm,eks,lke,ocp,gke,oke} none describe
-# this machine. Hence `service: k0s`, registered here.
+# WHAT THIS IS: a worked example of how an org encodes its environment facts
+# as a --data overlay on top of upstream AICR. It is not a product service.
+# Upstream ships `service: k0s` itself since aicr v0.22.0 (v0.21.1 has no
+# recipes/overlays/k0s.yaml, v0.22.0 does; v0.20.0 rejects the value with
+# `invalid service type: k0s`). This leaf layers on those upstream overlays:
+# on v1.2.0 `metadata.appliedOverlays` is base, monitoring-hpa, h200-any, k0s,
+# k0s-training, k0s-h200-training. (v1.2.0, verified 2026-11-05.)
+#
+# DUPLICATES ON PURPOSE: several overrides below are also set upstream. They
+# are kept so a reader learning to write a pack sees every fact spelled out and
+# explained in one file, and so the pack keeps working on the previous pin
+# (v0.20.0 reads the same v1beta1 header and resolves it). They layer
+# harmlessly. On this leaf only toolkit.env and the >= 1.34 constraint are
+# true duplicates of upstream; driver off, nvidiaDriverRoot, assumeDriverInstalled
+# and MIG off are REQUIRED here (see the ubuntu-leaf note in this block). Each is
+# annotated below. What upstream sets, verified against the v1.2.0 overlay
+# files and a resolve on the v1.2.0 binary (2026-11-05):
+#   - upstream `k0s` overlay (aicr >= v0.22.0): gpu-operator toolkit.env
+#     (the three CONTAINERD_* vars) and the K8s.server.version >= 1.34
+#     constraint. Nothing else.
+#   - upstream `os: ubuntu` leaf `h200-k0s-ubuntu-training`: driver.enabled
+#     false, migManager.enabled false, nvidiaDriverRoot /, nvsentinel
+#     labeler.assumeDriverInstalled true (and a janitor hostDriverRootPath).
+#     This leaf is NOT applied to the OS-agnostic leaf below (it has no `os`
+#     in its criteria), so on this leaf those facts do depend on this pack.
+#     Upstream's leaf and this leaf coexist (`aicr recipe list --data` shows
+#     both). With this pack loaded, `--os ubuntu` applies BOTH leaves (this
+#     one first, upstream's last, so upstream's wins on the keys it sets);
+#     omitting `os` applies only this one. Without the pack, `--os ubuntu`
+#     applies only upstream's. (appliedOverlays order checked on v1.2.0,
+#     2026-11-05.)
+#
+# WHAT THIS PACK EXPLICITLY SETS beyond upstream's overlays: driver.rdma, gds
+# and gdrcopy off (no InfiniBand / nvidia_fs on the example host). Against
+# aicr's base gpu-operator values (recipes/components/gpu-operator/values.yaml
+# at v1.2.0, read 2026-11-05), only gdrcopy.enabled changes the effective value
+# (base true -> false); base already has driver.rdma.enabled false, so that
+# override is explicit-for-clarity; base does not set gds at all.
 #
 # Resolve with:
 #   aicr recipe --service k0s --accelerator h200 --intent training \
 #     --data ./packs/k0s-h200-training -o recipe.yaml
-apiVersion: aicr.run/v1alpha2
+apiVersion: aicr.run/v1beta1
 kind: RecipeMetadata
 metadata:
   name: k0s-h200-training
 spec:
   criteria:
-    service: k0s          # --data-private value (registers on load)
+    service: k0s          # upstream value since aicr v0.22.0 (v1.2.0 verified 2026-11-05); layers on its k0s overlays
     accelerator: h200     # OSS-embedded value
-    intent: training      # valid because this overlay declares the chain
+    intent: training
 
-  # k0s ships k8s >= 1.34 on v1.36.x; matches the upstream training leaves.
+  # Also set by upstream k0s overlay (aicr >= v0.22.0), which gives the same
+  # `>= 1.34` constraint; kept here as a duplicate (v1.2.0, verified 2026-11-05).
   constraints:
     - name: K8s.server.version
       value: ">= 1.34"
 
   componentRefs:
-    # Two different kinds of fact ride under this single `service: k0s`
-    # value below, and a future upstream contributor should not conflate
-    # them:
-    #   - k0s-GENERAL, upstream-portable: gpu-operator's `toolkit.env`
-    #     (the containerd socket/config/runtime-class paths, a few lines
-    #     down). k0s bundles its own containerd instead of using the
-    #     distro default; this is true of ANY k0s node, not just this one.
-    #     A general upstream `service: k0s` overlay should carry only this.
-    #   - THIS-FLEET-ONLY, not a k0s fact at all: `driver.enabled: false`
-    #     + nvidia-dra-driver-gpu's `nvidiaDriverRoot: /` (plenty of
-    #     k0s+GPU clusters want gpu-operator to install the driver instead
-    #     — see upstream `bcm`, which does exactly that); `driver.rdma.
-    #     enabled: false` and `gdrcopy.enabled: false` (absence of
-    #     InfiniBand is a hardware fact of this one host, unrelated to
-    #     which distro runs); `gds.enabled: false` (absence of the
-    #     nvidia_fs module is likewise a hardware/host-config fact, not a
-    #     k0s fact); `migManager.enabled: false` (an operational policy
-    #     choice, not a k0s or hardware fact). These ride along here
-    #     because this pack is scoped to one demo fleet — not because
-    #     registering `service: k0s` implies any of them.
+    # Scope note. The k0s-general part of this example (gpu-operator's
+    # `toolkit.env`, a few lines down: k0s bundles its own containerd instead
+    # of the distro default, true of ANY k0s node) now lives upstream in the
+    # `k0s` overlay, so on aicr >= v0.22.0 it is a duplicate here. What stays
+    # specific to the example fleet, not k0s facts:
+    #   - driver ownership (`driver.enabled: false` + nvidia-dra-driver-gpu's
+    #     `nvidiaDriverRoot: /`) and `migManager.enabled: false`: upstream sets
+    #     these only in its `os: ubuntu` leaf, not in the k0s overlay;
+    #   - `driver.rdma.enabled: false` and `gdrcopy.enabled: false` (no
+    #     InfiniBand on this host) and `gds.enabled: false` (no nvidia_fs
+    #     module): hardware/host facts, set by no upstream overlay in the
+    #     chain this leaf resolves through.
     - name: gpu-operator
       type: Helm
       overrides:
@@ -56,7 +80,7 @@ spec:
           # not install its own. MUST be paired with the DRA driver's
           # nvidiaDriverRoot below — aicr's driver-ownership coherence check
           # exits 2 if only one side is set.
-          enabled: false
+          enabled: false   # also set by upstream's `os: ubuntu` leaf h200-k0s-ubuntu-training, not by its k0s overlay (v1.2.0, verified 2026-11-05)
           rdma:
             # No RDMA/InfiniBand on this host — verified 2026-08-26: no
             # ib_/rdma_/mlx kernel modules loaded, /sys/class/infiniband is
@@ -64,12 +88,16 @@ spec:
             # nothing to bind to.
             enabled: false
         toolkit:
-          # UNLIKE the upstream `kind` overlay, the toolkit IS installed:
-          # this host has no nvidia-container-toolkit. It must target k0s's
-          # own containerd, not the distro default — otherwise the toolkit
-          # configures the wrong containerd, reports success, and GPU pods
-          # fail with `no runtime for "nvidia" is configured`.
+          # This host has no nvidia-container-toolkit, so the operator
+          # installs it. `enabled: true` is also what an upstream-only k0s
+          # bundle gets (aicr's base gpu-operator values, v1.2.0, verified
+          # 2026-11-05), so it is explicit here for readability only. The env
+          # below must target k0s's own containerd, not the distro default —
+          # otherwise the toolkit configures the wrong containerd, reports
+          # success, and GPU pods fail with `no runtime for "nvidia" is
+          # configured`.
           enabled: true
+          # The env list is also set by the upstream k0s overlay (aicr >= v0.22.0).
           env:
             - name: CONTAINERD_CONFIG
               value: /etc/k0s/containerd.d/nvidia.toml
@@ -90,6 +118,8 @@ spec:
           # workloads (it can require draining/rebooting a node), so it
           # should be an explicit opt-in rather than a default this pack
           # forces on every k0s+H200 cluster.
+          # Also set by upstream's `os: ubuntu` leaf h200-k0s-ubuntu-training,
+          # not by its k0s overlay (v1.2.0, verified 2026-11-05).
           enabled: false
 
     - name: nvidia-dra-driver-gpu
@@ -97,20 +127,23 @@ spec:
       overrides:
         # Host-installed driver userspace lives at the host root. Required
         # counterpart to gpu-operator driver.enabled=false (see above).
+        # Also set by upstream's `os: ubuntu` leaf h200-k0s-ubuntu-training,
+        # not by its k0s overlay (v1.2.0, verified 2026-11-05).
         nvidiaDriverRoot: /
 
     - name: nvsentinel
       type: Helm
       overrides:
         labeler:
-          # aicr >= v0.19 adds a second driver-ownership coherence check:
-          # with the driver host-provided (gpu-operator driver.enabled=false
+          # With the driver host-provided (gpu-operator driver.enabled=false
           # above) there is no driver pod for NVSentinel's labeler to
-          # observe, and `aicr bundle` fails closed unless the labeler is
-          # told the driver is present — without it, several NVSentinel
-          # DaemonSets come up with 0 desired pods while the rest of the
-          # stack looks healthy. Pairs with driver.enabled=false /
-          # nvidiaDriverRoot=/ (this-fleet driver-ownership facts, see the
-          # scope note above). Verified 2026-08-30: v0.20.0 bundles cleanly
-          # with this override; v0.18.0 accepts it and bundles cleanly too.
+          # observe, and `aicr bundle` fails closed unless the labeler is told
+          # the driver is present. Verified 2026-11-05 on v1.2.0: with this
+          # set to false the bundle exits 2 ("labeler.assumeDriverInstalled
+          # is not set ... come up with 0 desired pods"); with it true the
+          # bundle succeeds and `aicr verify` passes. Pairs with
+          # driver.enabled=false / nvidiaDriverRoot=/ (see above). Also set by
+          # upstream's `os: ubuntu` leaf h200-k0s-ubuntu-training, not by its
+          # k0s overlay. v0.20.0's bundle also exits 2 with it false
+          # (verified 2026-11-05).
           assumeDriverInstalled: true

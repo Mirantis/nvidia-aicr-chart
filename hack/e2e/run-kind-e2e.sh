@@ -19,7 +19,11 @@
 # Splitting gives validation room, and the scenarios can run in parallel.
 #
 # Nothing leaves the machine. Requires: docker, kind, kubectl, helm, curl,
-# python3. Each scenario is ~10-15 min.
+# python3. One run on 2026-10-22, v1.1.2 (Docker Desktop, 8 CPU / 16 GB,
+# other kind clusters running on the same host): pack ~26 min and
+# validate ~10 min of kind cluster lifetime, ~36 min for --scenario all.
+# One run on 2026-11-05, v1.2.0: --scenario all 16m51s end to end (pack
+# ~6m20s, validate ~10m30s), KIND E2E PASSED, 21 ok.
 #
 # Usage: hack/e2e/run-kind-e2e.sh [--scenario pack|validate|all] [--keep]
 #                                 [--cluster PREFIX]
@@ -127,11 +131,27 @@ setup_cluster() {  # $1 = scenario name
 # pulling inside aicr's --timeout window, on a node that is brand-new each
 # run (observed: 31 MB agent image stuck ContainerCreating/Pulling for
 # 38 min; a fresh anonymous ghcr pull per run is exactly the throttling
-# shape). All of them use imagePullPolicy: IfNotPresent (agent verified
-# against the v0.18.0 and v0.20.0 binaries; validators observed live,
-# 2026-08-11 and 2026-09-02), so pulling them into the node ahead of time
-# means the kubelet finds them already present. A pull failure here fails
-# fast and visibly instead of burning validate's whole timeout.
+# shape). All of them use imagePullPolicy: IfNotPresent, so pulling them
+# into the node ahead of time means the kubelet finds them already present.
+# On v1.1.2, 2026-10-22 (observed live in a full e2e run; historical): the
+# agent Job (ghcr.io/nvidia/aicr:v1.1.2) and all four deployment-phase
+# validator Jobs (operator-health, expected-resources, gpu-operator-version,
+# check-nvidia-smi; ghcr.io/nvidia/aicr-validators/deployment:v1.1.2) carried
+# IfNotPresent, and each pod's Pulled event read "Container image ...
+# already present on machine".
+# The tag comes from appVersion, so at the v1.2.0 pin this pulls
+# ghcr.io/nvidia/aicr:v1.2.0 and ghcr.io/nvidia/aicr-validators/deployment:v1.2.0
+# (both manifests HTTP 200 on an anonymous GET, 2026-11-05; the image
+# repositories named in the v1.2.0 binary are the same set as in v1.1.2's,
+# checked with `strings`). Observed on v1.2.0, 2026-11-05 (full e2e run):
+# both images preloaded as linux/arm64 while the Job ran the linux_amd64
+# aicr binary; the agent pod (ghcr.io/nvidia/aicr:v1.2.0) and the same four
+# validator pods (ghcr.io/nvidia/aicr-validators/deployment:v1.2.0) carried
+# IfNotPresent, and each Pulled event read "Container image ... already
+# present on machine".
+# (Earlier pins: agent checked against the v0.18.0 and v0.20.0 binaries,
+# validators observed live 2026-08-11 and 2026-09-02.) A pull failure here
+# fails fast and visibly instead of burning validate's whole timeout.
 #
 # Pulled with `ctr images pull` directly INSIDE the node's own containerd
 # (namespace k8s.io — the one kubelet/CRI reads), not host-side `docker
@@ -142,7 +162,11 @@ setup_cluster() {  # $1 = scenario name
 # ghcr.io/nvidia/aicr:v0.20.0` fails with "no suitable export target found
 # ... does not provide the specified platform (linux/arm64)" (reproduces
 # identically on a fresh v0.18.0 pull, so it's a local Docker Desktop bug,
-# not an aicr image or version problem). Pulling straight into the node
+# not an aicr image or version problem). On 2026-10-22, Docker Desktop
+# 29.8.2: one fresh `docker pull` + `docker save --platform linux/arm64`
+# each of ghcr.io/nvidia/aicr:v1.1.2, ghcr.io/nvidia/aicr:v0.20.0 and
+# ghcr.io/nvidia/aicr-validators/deployment:v1.1.2 exited 0 (a single
+# observation; output not retained). Pulling straight into the node
 # sidesteps the host docker layer entirely, at the cost of the host-side
 # layer cache across repeated e2e runs that the old approach had.
 #
@@ -379,13 +403,16 @@ sys.exit(0 if s['tests'] > 0 else 1)" \
     ptr=$(K -n aicr get cm aicr-evidence-bundle -o jsonpath='{.data.pointer\.yaml}' 2>/dev/null || true)
     has "schemaVersion" "$ptr" && pass "pointer captured to evidence CM" \
       || fail "pointer capture"
-    # `--emit-attestation` alone writes a pointer with empty digest/oci
-    # (verified on v0.18.0), so presence proves nothing about publishing —
-    # a populated oci field is the real signal that the push happened.
+    # `--emit-attestation` alone wrote a pointer with empty digest/oci on
+    # v0.18.0 (not re-checked on v1.1.2 or v1.2.0), so presence is not taken
+    # as proof of publishing — a populated oci field is the signal the push
+    # happened.
     has_re 'oci:[[:space:]]*[^"[:space:]]' "$ptr" && pass "pointer records a published OCI ref" \
       || fail "pointer has no OCI ref — publish did not push"
     # --no-sign omits the signer field entirely on v0.18.0 (observed
-    # 2026-08-10) and v0.20.0 (observed 2026-09-02).
+    # 2026-08-10), v0.20.0 (observed 2026-09-02) and v1.1.2 (observed
+    # 2026-10-22) and v1.2.0 (observed 2026-11-05): this assertion passed
+    # against the published pointer.
     has "signer" "$ptr" && fail "unsigned pointer unexpectedly carries a signer" \
       || pass "pointer is unsigned (no signer field)"
     tgz=$(K -n aicr get cm aicr-evidence-bundle -o jsonpath='{.binaryData.evidence\.tgz}' 2>/dev/null || true)

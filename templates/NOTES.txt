@@ -21,12 +21,16 @@ the CTRF verdict once the Job completes:
   kubectl get cm {{ .Values.validate.resultConfigMap }} -n {{ .Release.Namespace }} -o jsonpath='{.data.ctrf\.json}'
 {{- if .Values.validate.emitEvidence }}
 
-The evidence bundle lands in ConfigMap {{ .Values.validate.evidenceConfigMap }}.
+The evidence bundle is captured (gzipped, key evidence.tgz) to ConfigMap
+{{ .Values.validate.evidenceConfigMap }} when validate emits one and it fits the
+ConfigMap size budget; otherwise the Job log says what was kept.
 {{- end }}
 {{- if (.Values.validate.publish | default dict).enabled }}
-The bundle is published ({{ .Values.validate.publish.mode }}) to
-{{ .Values.validate.publish.ref }}; the pointer is captured as key
-pointer.yaml on ConfigMap {{ .Values.validate.evidenceConfigMap }}.
+Publishing ({{ .Values.validate.publish.mode }}) was requested to
+{{ .Values.validate.publish.ref }}. It is advisory unless
+validate.publish.failOnError is true: check the Job log ("evidence publish
+exit=") and, when the push produced one, the pointer.yaml key on ConfigMap
+{{ .Values.validate.evidenceConfigMap }}.
 {{- end }}
 {{- end }}
 

@@ -10,7 +10,10 @@ accelerator: h200
 intent: training
 dataPack: "ghcr.io/acme/acme-aicr-pack:1.0.0"
 dataPackSecret: "aicr-pack-pull"
-validateFlags: "--namespace aicr --image-pull-secret aicr-pack-pull --node-selector kubernetes.io/hostname=CHANGE-ME"
+# --namespace is the release namespace (nvidia-aicr in the README install and
+# the fleet example), where aicr-pack-pull lives; validator Jobs in any other
+# namespace could not find the pull secret.
+validateFlags: "--namespace nvidia-aicr --image-pull-secret aicr-pack-pull --node-selector kubernetes.io/hostname=CHANGE-ME"
 
 validate:
   enabled: true               # required with deploy.enabled: false

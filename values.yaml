@@ -3,29 +3,47 @@
 # recipe overlays don't define (many overlays are os- or platform-agnostic).
 #
 # There is deliberately NO default accelerator. The old default (a100 with
-# service=any) resolved the THINNEST recipe in the embedded catalog — 11
-# components vs 15 for a fully-specified leaf — silently. Rendering fails
+# service=any) resolved the THINNEST recipe in the embedded catalog — 12
+# components vs 15 for a fully-specified leaf such as eks+h100+ubuntu+training
+# (v1.2.0, verified 2026-11-05) — silently. Rendering fails
 # unless you state an accelerator, set a dataPack (the pack owns criteria
 # completeness), or state a concrete service plus an intent (accelerator-less
 # leaves such as bcm+inference exist upstream).
-accelerator: ""        # h100 | h200 | gb200 | gb300 | b200 | a100 | l40 | l40s | rtx-pro-6000
-# intent must stay empty with service=any: at aicr v0.20.0 (verified;
-# unchanged since v0.18.0) a stated intent requires a service/os combination
-# that declares it (aks/bcm/eks/lke/ocp/gke+cos/oke) — `service: any`
-# overlays declare service+accelerator only, so `intent: training` fails
-# resolution outright. Set intent only together with a service that
+accelerator: ""        # h100 | h200 | gb200 | gb300 | b200 | b300 | a100 | l40 | l40s | rtx-pro-6000 | vr200
+# intent must stay empty with service=any: a stated intent requires a
+# service (or service+os) combination that declares it. v1.2.0, verified
+# 2026-11-05 (`aicr recipe --service any --accelerator h100 --intent <x>`
+# exits 2 and lists them):
+#   training:  aks, bcm, eks, k0s, kind, lke, ocp, rke2, cks+ubuntu, gke+cos, oke+ol
+#   inference: aks, bcm, eks, kind, lke, mk8s, ocp, rke2, gke+cos, oke+ol
+# `service: any` overlays declare service+accelerator only, so any+intent
+# fails resolution outright. Set intent only together with a service that
 # provides it (e.g. service: kind, intent: training).
 intent: ""             # "" (omit) | training | inference
-os: ""                 # "" (omit) | ubuntu | rhel | cos | amazonlinux | ol | talos
-platform: ""           # "" (omit) | kubeflow | dynamo | nim | runai | slurm
-# Managed-service overlay. "any" (aliases: self-managed, self, vanilla) matches
-# base+accelerator overlays without requiring a substrate overlay - the right
-# value for self-managed clusters such as k0rdent-provisioned k0s. Explicit
-# values: aks | bcm | eks | gke | kind | lke | metal3 | ocp | oke.
+os: ""                 # "" (omit) | ubuntu | rhel | rocky | cos | amazonlinux | ol | sles | talos
+platform: ""           # "" (omit) | kubeflow | dynamo | kueue | nim | runai | slurm
+# Managed-service overlay. "any" matches base+accelerator overlays without
+# requiring a substrate overlay - the right value for self-managed clusters
+# that have no service of their own. Explicit values (v1.2.0, verified
+# 2026-11-05): aks | bcm | cks | eks | generic | gke | k0s | kind | lke |
+# metal3 | mk8s | nvke | ocp | oke | rke2. `generic` and `metal3` are accepted
+# by the CLI but have no recipe for most accelerators (e.g. h100: exit 2, "no
+# recipe provides service"; v1.2.0, verified 2026-11-05).
+# k0s (accepted from aicr v0.22.0, verified 2026-10-22; its overlay re-checked
+# on v1.2.0, 2026-11-05) points the
+# container-toolkit at k0s's own containerd and requires K8s >= 1.34 — the
+# exact replacement for chart <= 0.2.0's environment.k0sContainerd. It does not turn off the
+# operator-managed driver; only the h200-k0s-ubuntu-training leaf does (see
+# environment.preinstalledDriver). Use it on k0s, including
+# k0rdent-provisioned clusters.
+# At v1.2.0 the names self-managed, self and vanilla resolve to service
+# `generic`, NOT to "any" (verified 2026-11-05: `--service self-managed
+# --accelerator h100` exits 2, "no recipe provides service 'generic'"); the
+# embedded catalog's only generic leaf is gb300+ubuntu+training.
 service: any
 
 # AICR binary
-aicrVersion: v0.20.0   # https://github.com/NVIDIA/aicr/releases
+aicrVersion: v1.2.0    # https://github.com/NVIDIA/aicr/releases
 aicrArch: amd64        # amd64 | arm64
 # Optional strict pin: sha256 of the release tarball, keyed by architecture
 # (from aicr_checksums.txt). When the entry for the selected aicrArch is
@@ -36,13 +54,28 @@ aicrArch: amd64        # amd64 | arm64
 # Keyed by arch so that switching aicrArch cannot silently check a tarball
 # against the wrong architecture's hash. Update on every aicrVersion bump.
 aicrSha256:
-  amd64: "a80a7ed1ad7474434c929efbea77223b0eb156f901569319698e9bdb9e1126f9"  # v0.20.0 linux_amd64
-  arm64: "f8353a56ff430714818879c8b4c4de057c0e3cea11beb34f45e4753db8f300f5"  # v0.20.0 linux_arm64
+  amd64: "3ff6935fd7988373903a2a30f1c24a74a5f8a9052a310615db19fcfec4cfe9a2"  # v1.2.0 linux_amd64
+  arm64: "26824146cd0743229239899cb75d3b68e0bc262bcdb357fccc98eca0a5b75976"  # v1.2.0 linux_arm64
 
 # Install behavior
 storageClass: ""       # if non-empty, passed as --storage-class to `aicr bundle`
-recipeFlags: ""        # extra flags passed to `aicr recipe` (e.g. "--criteria-strict")
-# Extra flags passed to `aicr validate`. Notable production flags:
+# Structured passthrough: each *Args list element is one argument, so spaces,
+# apostrophes and glob characters are preserved. Prefer these list forms and
+# quote every element, including numbers and booleans.
+# Rendered by Helm v4.3.0 and exercised with bash 5.3.20(1)-release,
+# verified 2026-11-05 by hack/verify-render.sh.
+recipeArgs: []         # arguments appended to `aicr recipe`
+validateArgs: []       # arguments appended to `aicr validate`
+bundleArgs: []         # arguments appended to `aicr bundle`
+# Legacy passthrough: each *Flags string is expanded unquoted, split on
+# whitespace, NO shell quoting is interpreted (quotes and apostrophes reach
+# aicr/deploy.sh as literal characters), and glob patterns can expand against
+# the Job's working directory (/tmp; the bundle directory for deployFlags).
+# A non-matching glob passes through literally. For --set-json in a legacy
+# string, write JSON without spaces. List arguments are appended AFTER the
+# corresponding legacy string, so both forms can be used together.
+recipeFlags: ""        # legacy whitespace-split arguments for `aicr recipe`
+# Legacy arguments for `aicr validate`. Notable production flags:
 #   --namespace <ns>              where validator Jobs run (default: aicr-validation)
 #   --image-pull-secret <name>    Secret for private validator images (repeatable;
 #                                 must exist in the validator Jobs' namespace)
@@ -50,28 +83,30 @@ recipeFlags: ""        # extra flags passed to `aicr recipe` (e.g. "--criteria-s
 # Tip: pass --namespace <release ns> and the SAME dockerconfigjson Secret used
 # for dataPackSecret can serve as the validator pull secret — one Secret total.
 validateFlags: ""
-# Extra flags passed to `aicr bundle`. Notable org-facing flags:
+# Legacy arguments for `aicr bundle`. Notable org-facing flags:
 #   --accelerated-node-toleration key=value:effect   tolerate tainted GPU nodes
 #   --system-node-selector key=value                 pin system components
 #   --set component:path=value                       per-component overrides
 #   --vendor-charts                                  pull chart bytes into bundle (air-gap prep)
 bundleFlags: ""
 
-# Cluster environment profile. These toggles inject the component overrides a
-# cluster needs before the NVIDIA stack can converge. They are applied BEFORE
-# bundleFlags, so anything you set there wins.
+# Cluster environment profile. This toggle injects the component overrides a
+# cluster needs before the NVIDIA stack can converge. It is applied BEFORE
+# bundleFlags and bundleArgs, so anything you set there wins.
+# (environment.k0sContainerd was removed in chart 0.3.0: use service: k0s.
+# Any value other than false/absent/null fails the render with a migration
+# message.)
 environment:
-  # k0s runs its own containerd (socket /run/k0s/containerd.sock, drop-ins in
-  # /etc/k0s/containerd.d). Without this the container-toolkit configures the
-  # DEFAULT containerd, reports success, and GPU pods then fail with
-  # `no runtime for "nvidia" is configured`. Set true on k0s clusters,
-  # including k0rdent-provisioned ones.
-  k0sContainerd: false
   # Nodes already carry an NVIDIA driver (host package, DKMS, or baked image):
   # the GPU operator must not install its own, and the DRA driver must read the
-  # host root. aicr's driver-ownership coherence check requires both together;
-  # aicr >= v0.19 additionally requires the NVSentinel labeler to be told the
-  # driver is host-provided, so the toggle sets all three together.
+  # host root. aicr's driver-ownership coherence check requires both together,
+  # and `aicr bundle` also fails closed unless the NVSentinel labeler is told
+  # the driver is host-provided, so the toggle sets all three together (v1.2.0,
+  # verified 2026-11-05).
+  # Still needed on k0s with a host driver: service: k0s carries only the
+  # containerd wiring. Upstream sets these driver facts itself only in the
+  # h200-k0s-ubuntu-training leaf (accelerator: h200, intent: training,
+  # os: ubuntu); there the toggle repeats them and the bundle still succeeds.
   preinstalledDriver: false
 
 # The deploy leg (bundle + deploy.sh). Set enabled: false for an ASSERT-ONLY
@@ -85,8 +120,12 @@ environment:
 # assertion working, not a malfunction.
 deploy:
   enabled: true
-deployFlags: "--best-effort --no-wait"   # deploy.sh flags: --best-effort | --no-wait | --retries N
-runtimeImage: alpine/k8s:1.34.0          # base image (must include bash, curl, kubectl + helm)
+deployArgs: []          # arguments appended after deployFlags; set deployFlags: "" for list-only args
+deployFlags: "--best-effort --no-wait"   # legacy whitespace-split arguments: --best-effort | --no-wait | --retries N
+# Multi-arch index digest covering linux/amd64 and linux/arm64; resolved with
+# Docker 29.9.2 `docker manifest inspect` and the registry API, verified
+# 2026-11-05. Refresh the tag and digest via CONTRIBUTING's release checklist.
+runtimeImage: alpine/k8s:1.34.0@sha256:b5f6edfeac5279f3e182d938d1ffecb62f7c980756ac4b6b66d7f0d566782f77 # must include bash, curl, kubectl + helm
 
 # AICR --data extension pack (runtime catalog/criteria/validator overlays —
 # see aicr docs/integrator/data-extension.md). OCI artifact reference WITHOUT
@@ -123,7 +162,10 @@ dataPackAuth:
 # TLS with a real CA; leave both false.
 dataPackPlainHTTP: false    # registry speaks plain HTTP (e.g. in-cluster registry:2)
 dataPackInsecureTLS: false  # registry has TLS but an untrusted certificate
-orasImage: ghcr.io/oras-project/oras:v1.2.0   # initContainer image for the pack pull
+# Multi-arch index digest covering linux/amd64 and linux/arm64 (and the other
+# upstream architectures); resolved with Docker 29.9.2 and the registry API,
+# verified 2026-11-05. Refresh it via CONTRIBUTING's release checklist.
+orasImage: ghcr.io/oras-project/oras:v1.2.0@sha256:0087224dd0decc354b5b0689068fbbc40cd5dc3dbf65fcb3868dfbd363dc790b # initContainer image for the pack pull
 
 # Resolved-recipe visibility: right after `aicr recipe` succeeds, the resolver's
 # own completion summary (criteria used, component count and names, overlay

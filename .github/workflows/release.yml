@@ -58,7 +58,7 @@ jobs:
       # `helm lint .` reports "0 chart(s) failed" even when the criteria
       # guard fails the render, so it cannot catch a broken template.
       - name: helm lint
-        run: helm lint . --strict --set accelerator=h100
+        run: helm lint . --strict --set accelerator=h100 --kube-version 1.34.0
 
       - name: Verify render
         run: ./hack/verify-render.sh .
@@ -78,14 +78,85 @@ jobs:
       # exact version, so republishing it would swap chart bytes underneath a
       # consumer with no signal. Bump Chart.yaml instead.
       - name: Refuse to overwrite a published version
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           CHART_NAME="$(helm show chart . | awk '/^name:/ {print $2}')"
-          if helm show chart "${{ steps.v.outputs.registry }}/${CHART_NAME}" \
-               --version "${{ steps.v.outputs.version }}" >/dev/null 2>&1; then
-            echo "::error::${CHART_NAME} ${{ steps.v.outputs.version }} is already published — bump the chart version"
-            exit 1
+          REGISTRY="${{ steps.v.outputs.registry }}"
+          VERSION="${{ steps.v.outputs.version }}"
+          REPOSITORY="${REGISTRY#oci://ghcr.io/}/${CHART_NAME}"
+          MANIFEST_URL="https://ghcr.io/v2/${REPOSITORY}/manifests/${VERSION}"
+          TOKEN=""
+          TOKEN_SOURCE=anonymous
+
+          # Try GHCR's anonymous token flow first. A raw job token is not a
+          # registry bearer: exchange it for a scoped pull token when required.
+          if RESPONSE="$(curl -fsSL --retry 2 --retry-all-errors \
+                --connect-timeout 10 --max-time 30 \
+                "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull")"; then
+            TOKEN="$(printf '%s' "$RESPONSE" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])' 2>/dev/null || true)"
           fi
-          echo "version ${{ steps.v.outputs.version }} is unpublished; proceeding"
+
+          exchange_token() {
+            local response token
+            response="$(curl -fsS -u "${{ github.actor }}:${GHCR_TOKEN}" \
+              --retry 2 --retry-all-errors --connect-timeout 10 --max-time 30 \
+              "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPOSITORY}:pull")" || return
+            token="$(printf '%s' "$response" \
+              | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])' 2>/dev/null)" || return
+            [ -n "$token" ] || return 1
+            TOKEN="$token"
+          }
+
+          if [ -z "$TOKEN" ]; then
+            if [ -z "$GHCR_TOKEN" ] || ! exchange_token; then
+              echo "::error::could not obtain a GHCR pull token; refusing to proceed"
+              exit 1
+            fi
+            TOKEN_SOURCE=exchanged
+          fi
+
+          BODY="$(mktemp)"
+          trap 'rm -f "$BODY"' EXIT
+          check_manifest() {
+            local bearer="$1" attempt code=""
+            for attempt in 1 2 3; do
+              code="$(curl -sS --connect-timeout 10 --max-time 30 \
+                -o "$BODY" -w '%{http_code}' \
+                -H "Authorization: Bearer ${bearer}" \
+                -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.cncf.helm.config.v1+json' \
+                "$MANIFEST_URL" || true)"
+              case "$code" in 200|404) break ;; esac
+              if [ "$attempt" -lt 3 ]; then sleep 2; fi
+            done
+            printf '%s' "${code:-000}"
+          }
+
+          CODE="$(check_manifest "$TOKEN")"
+          if { [ "$CODE" = 401 ] || [ "$CODE" = 403 ]; } \
+              && [ "$TOKEN_SOURCE" = anonymous ] && [ -n "$GHCR_TOKEN" ] \
+              && exchange_token; then
+            CODE="$(check_manifest "$TOKEN")"
+          fi
+          case "$CODE" in
+            200)
+              echo "::error::${CHART_NAME} ${VERSION} is already published — bump the chart version"
+              exit 1
+              ;;
+            404)
+              if ! grep -Eq '"code"[[:space:]]*:[[:space:]]*"(MANIFEST_UNKNOWN|NAME_UNKNOWN)"' "$BODY"; then
+                echo "::error::GHCR manifest lookup at ${MANIFEST_URL} returned HTTP 404 with an unrecognized body; refusing to proceed"
+                exit 1
+              fi
+              echo "version ${VERSION} is unpublished; proceeding"
+              ;;
+            *)
+              echo "::error::GHCR manifest lookup returned HTTP ${CODE:-000} after retries; refusing to proceed"
+              exit 1
+              ;;
+          esac
 
       - name: Push chart
         run: helm push "${{ steps.package.outputs.file }}" "${{ steps.v.outputs.registry }}"
