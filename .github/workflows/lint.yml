@@ -20,7 +20,7 @@ jobs:
       # `helm lint .` reports "0 chart(s) failed" even when the criteria
       # guard fails the render, so it cannot catch a broken template.
       - name: helm lint
-        run: helm lint . --strict --set accelerator=h100
+        run: helm lint . --strict --set accelerator=h100 --kube-version 1.34.0
 
       # Renders every conditional path and asserts on rendered VALUES.
       # Shared with the release workflow so a tag cannot publish a chart whose

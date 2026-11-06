@@ -6,6 +6,31 @@
 {{- if . }}"true"{{- else }}"false"{{- end }}
 {{- end }}
 
+{{- /* Render one structured passthrough argument as exactly one bash word.
+       A literal apostrophe closes the single-quoted word, emits '\'' and reopens
+       it; unlike the legacy unquoted strings, whitespace and glob characters
+       therefore reach the CLI unchanged (Helm v4.3.0 and bash 5.3.20(1)-release,
+       exercised by hack/verify-render.sh, verified 2026-11-05). */ -}}
+{{- define "nvidia-aicr.shellArg" -}}
+{{- $arg := replace "'" `'\''` (toString .) -}}
+{{- $arg = replace "\n" `'$'\n''` $arg -}}
+'{{ $arg }}'
+{{- end }}
+
+{{- /* Validate and render a structured passthrough list. Rejecting scalar lists
+       and non-string elements here avoids Go's raw range error and prevents
+       numbers, nulls or maps from being stringified into different arguments.
+       Exercised with Helm v4.3.0 and v3.19.0 by hack/verify-render.sh,
+       verified 2026-11-05. */ -}}
+{{- define "nvidia-aicr.shellArgs" -}}
+{{- $key := .key -}}
+{{- $args := .args -}}
+{{- if not (kindIs "slice" $args) -}}
+{{- fail (printf "%s must be a YAML list of strings" $key) -}}
+{{- end -}}
+{{- range $index, $arg := $args }}{{ if not (kindIs "string" $arg) }}{{ fail (printf "%s[%d] must be a string; quote every element, including numbers and booleans" $key $index) }}{{ end }}{{ include "nvidia-aicr.shellArg" $arg }} {{ end }}
+{{- end -}}
+
 {{- /* Resolve which pull Secret the pack initContainer uses: an existing
        one (dataPackSecret), the chart-managed one (dataPackAuth), or none.
        Both at once is a configuration error — fail the render, never pick

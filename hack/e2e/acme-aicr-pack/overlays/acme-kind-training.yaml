@@ -10,7 +10,7 @@
 # Resolve with:
 #   aicr recipe --service acme --accelerator h100 --intent training \
 #     --data ./acme-aicr-pack -o recipe.yaml
-apiVersion: aicr.run/v1alpha2
+apiVersion: aicr.run/v1beta1
 kind: RecipeMetadata
 metadata:
   name: acme-kind-training

@@ -1,6 +1,18 @@
 {{- if kindIs "string" .Values.aicrSha256 }}
 {{- fail "aicrSha256 is now a per-architecture map, e.g. aicrSha256: { amd64: \"<sha>\", arm64: \"<sha>\" }. Move your value under the key matching aicrArch." }}
 {{- end }}
+{{- /* environment.k0sContainerd was retired in favour of upstream's own
+       `service: k0s` overlay (aicr v0.22.0 is the first release that
+       accepts it; v0.21.1 exits 2 "invalid service type: k0s"; verified
+       2026-10-22). A truthy
+       value fails the render instead of being silently ignored, which
+       would leave a k0s cluster without the containerd wiring its values
+       asked for. Truthiness goes through
+       nvidia-aicr.bool so `1` is rejected exactly like `true`; `false`
+       means "not using it" and is accepted, same as absent. */}}
+{{- if eq (include "nvidia-aicr.bool" (.Values.environment | default dict).k0sContainerd) "\"true\"" }}
+{{- fail "environment.k0sContainerd was removed in chart 0.3.0. aicr >= v0.22.0 carries the k0s containerd configuration in its own `service: k0s` overlay: on a stock k0s cluster set service: k0s (requires Kubernetes >= 1.34) and delete this key. If your org pack registers its own service value (so service: k0s is not an option), carry the gpu-operator toolkit.env override in the pack's overlay (the three CONTAINERD_* entries: CONTAINERD_CONFIG, CONTAINERD_SOCKET, CONTAINERD_RUNTIME_CLASS), or pass it with bundleArgs: [\"--set-json\", \"gpuoperator:toolkit.env=[...]\"] (each list element is one argument, so the JSON may contain spaces). The legacy bundleFlags --set-json gpuoperator:toolkit.env=[...] form remains supported, but its JSON must be written without quotes and with no whitespace inside (bundleFlags is split on whitespace and no shell quoting is interpreted). See the README section \"k0s clusters\" for the exact long form." }}
+{{- end }}
 {{- /* compact drops empty entries: `--set validate.phases={}` yields a
        single-element list containing "", which is truthy but produces no
        --phase flags, making aicr run every phase including performance. */}}
@@ -13,9 +25,12 @@
        the THINNEST recipe in the embedded catalog. Escapes are exact:
        a stated accelerator; a dataPack (the org pack owns criteria
        completeness); or a concrete service plus intent (accelerator-less
-       leaves like bcm+inference exist upstream). service "any" and its
-       documented aliases (self-managed, self, vanilla) are NOT concrete —
-       aicr rejects any+intent outright. */}}
+       leaves like bcm+inference exist upstream). service "any" is NOT
+       concrete — aicr rejects any+intent outright. self-managed, self and
+       vanilla are treated the same: they were aliases of any up to aicr
+       v0.20.0, and at v1.2.0 (verified 2026-11-05) they resolve to
+       `generic`, whose only leaf still demands accelerator gb300, so with
+       no accelerator stated aicr rejects them + intent too (exit 2). */}}
 {{- if eq .Values.accelerator "any" }}
 {{- fail "accelerator: \"any\" is not a value — aicr rejects it as \"no criteria provided\". Leave accelerator empty and satisfy the criteria guard another way (dataPack, or concrete service plus intent), or state a real accelerator" }}
 {{- end }}
@@ -188,8 +203,6 @@ spec:
               value: {{ .Values.bundleFlags | quote }}
             {{- /* Booleans render via the nvidia-aicr.bool helper (see
                    _helpers.tpl for why truthiness, not `| quote`). */}}
-            - name: ENV_K0S_CONTAINERD
-              value: {{ include "nvidia-aicr.bool" .Values.environment.k0sContainerd }}
             - name: ENV_PREINSTALLED_DRIVER
               value: {{ include "nvidia-aicr.bool" .Values.environment.preinstalledDriver }}
             - name: DEPLOY_ENABLED
@@ -297,11 +310,13 @@ spec:
               [ -n "${OS}" ]          && RECIPE_ARGS+=(--os "${OS}")
               [ -n "${INTENT}" ]      && RECIPE_ARGS+=(--intent "${INTENT}")
               [ -n "${PLATFORM}" ]    && RECIPE_ARGS+=(--platform "${PLATFORM}")
-              # RECIPE_FLAGS/BUNDLE_FLAGS/DEPLOY_FLAGS are intentionally
-              # word-split: freeform passthrough for extra CLI flags.
+              # Legacy RECIPE_FLAGS, BUNDLE_FLAGS, DEPLOY_FLAGS and VALIDATE_FLAGS
+              # strings are intentionally word-split. Each list form is already
+              # shell-quoted by Helm and appended after its corresponding string.
+              RECIPE_VALUE_ARGS=( {{ include "nvidia-aicr.shellArgs" (dict "key" "recipeArgs" "args" .Values.recipeArgs) }})
               # tee'd so the resolver's own completion line (component count
               # and names) can be captured; pipefail keeps failure fatal.
-              ./aicr recipe "${RECIPE_ARGS[@]}" "${DATA_ARGS[@]}" ${RECIPE_FLAGS} 2>&1 | tee ./recipe.log
+              ./aicr recipe "${RECIPE_ARGS[@]}" "${DATA_ARGS[@]}" ${RECIPE_FLAGS} "${RECIPE_VALUE_ARGS[@]}" 2>&1 | tee ./recipe.log
               echo "Recipe size: $(wc -l < ./recipe.yaml) lines"
 
               # Resolved-recipe visibility: under-specified criteria resolve a
@@ -311,6 +326,7 @@ spec:
                 {
                   echo "criteria: service=${SERVICE} accelerator=${ACCELERATOR} os=${OS} intent=${INTENT} platform=${PLATFORM}"
                   [ -n "${RECIPE_FLAGS}" ] && echo "recipeFlags: ${RECIPE_FLAGS}"
+                  [ ${#RECIPE_VALUE_ARGS[@]} -gt 0 ] && printf 'recipeArgs:%s\n' "$(printf ' %q' "${RECIPE_VALUE_ARGS[@]}")"
                   [ -n "${DATA_PACK}" ]    && echo "dataPack: ${DATA_PACK}"
                   grep -o "recipe generation completed.*" ./recipe.log || true
                 } > ./summary.txt
@@ -341,26 +357,36 @@ spec:
                 BUNDLE_ARGS+=(--storage-class "${STORAGE_CLASS}")
               fi
               # Environment profile (values.environment.*), applied before
-              # BUNDLE_FLAGS so operator-supplied flags win. Note --set is
-              # scalar-only in aicr, hence --set-json for the toolkit env list.
+              # BUNDLE_FLAGS/BUNDLE_VALUE_ARGS so operator-supplied args win. (The k0s
+              # containerd profile is gone since chart 0.3.0: upstream's
+              # `service: k0s` overlay carries it.)
               PROFILE_ARGS=()
               if [ "${ENV_PREINSTALLED_DRIVER}" = "true" ]; then
                 PROFILE_ARGS+=(--set gpuoperator:driver.enabled=false)
                 PROFILE_ARGS+=(--set dradriver:nvidiaDriverRoot=/)
-                # aicr >= v0.19: a host-provided driver leaves no driver pod
-                # for NVSentinel's labeler to observe; without this flag
-                # `aicr bundle` fails closed (v0.20.0) and several NVSentinel
-                # DaemonSets would otherwise come up with 0 desired pods.
-                # Accepted (and needed for coherence) on the pinned version;
-                # also accepted by v0.18.0. Verified 2026-08-30.
+                # A host-provided driver leaves no driver pod for
+                # NVSentinel's labeler to observe. v1.2.0, verified
+                # 2026-11-05: with driver off and DRA root / but WITHOUT this
+                # flag, `aicr bundle` fails closed (exit 2, "labeler
+                # .assumeDriverInstalled is not set": metadata-collector and
+                # the syslog-health-monitor DaemonSets would come up with 0
+                # desired pods); with all three flags it exits 0. Not implied
+                # by service: k0s, whose overlay carries only the containerd
+                # wiring; the h200-k0s-ubuntu-training leaf sets the same
+                # facts itself, and the bundle still succeeds with the
+                # toggle on top of it.
                 PROFILE_ARGS+=(--set nv-sentinel:labeler.assumeDriverInstalled=true)
                 echo "profile: preinstalled driver (gpu-operator driver off, DRA root /, nvsentinel labeler assumes driver)"
               fi
-              if [ "${ENV_K0S_CONTAINERD}" = "true" ]; then
-                PROFILE_ARGS+=(--set-json 'gpuoperator:toolkit.env=[{"name":"CONTAINERD_CONFIG","value":"/etc/k0s/containerd.d/nvidia.toml"},{"name":"CONTAINERD_SOCKET","value":"/run/k0s/containerd.sock"},{"name":"CONTAINERD_RUNTIME_CLASS","value":"nvidia"}]')
-                echo "profile: k0s containerd (toolkit -> /run/k0s/containerd.sock)"
-              fi
-              ./aicr bundle "${BUNDLE_ARGS[@]}" "${DATA_ARGS[@]}" "${PROFILE_ARGS[@]}" ${BUNDLE_FLAGS}
+              BUNDLE_VALUE_ARGS=( {{ include "nvidia-aicr.shellArgs" (dict "key" "bundleArgs" "args" .Values.bundleArgs) }})
+              ./aicr bundle "${BUNDLE_ARGS[@]}" "${DATA_ARGS[@]}" "${PROFILE_ARGS[@]}" ${BUNDLE_FLAGS} "${BUNDLE_VALUE_ARGS[@]}"
+              # v1.2.0, verified 2026-11-05: next to the NNN-<component>/
+              # dirs, deploy.sh, recipe.yaml, README.md and checksums.txt, a
+              # bundle also holds UPGRADING.md and bundle-info.yaml, and with
+              # --data a copy of the pack under data/. aicr verify covers all
+              # of it. --output must stay outside the --data directory
+              # (./bundles here vs /data/pack): an output inside it recurses
+              # into itself until "file name too long" (exit 8).
               ls -la ./bundles/
 
               echo "=== Verifying bundle integrity ==="
@@ -369,8 +395,10 @@ spec:
               # trust level is "unverified": a closed-world checksum gate, not
               # provenance — but it fail-closes on any file added, removed, or
               # modified between bundle and execution, fully offline.
-              # Verified 2026-09-01 (v0.20.0): clean bundle passes exit 0;
-              # tampered deploy.sh fails exit 4. Exists on v0.18.0 too.
+              # v1.2.0, verified 2026-11-05: a clean unattested bundle prints
+              # "Trust level: unverified" and passes, exit 0; a bundle whose
+              # deploy.sh was appended to fails with "checksum mismatch for
+              # deploy.sh", exit 4.
               #
               # Handled explicitly rather than left to `set -e`: a bare
               # non-zero exit here would fail the Job with no line saying
@@ -385,33 +413,68 @@ spec:
               fi
 
               echo "=== Running deploy.sh ==="
-              # deploy.sh semantics differ by aicr version (both verified
-              # against the release artifacts — house rule 2):
-              #   v0.18.0: NEVER exits non-zero on component failures; it
-              #            only prints "Deployment completed with failures".
-              #   v0.20.0: exits 1 on the first component failure when
-              #            --best-effort is absent; WITH --best-effort it
-              #            still exits 0 and prints the same report line
-              #            (now suffixed "(--best-effort): <components>").
-              # Handle both: a non-zero exit fails the Job with context, and
-              # the report line is still detected ourselves — so on either
-              # version a partial install can never masquerade as success.
+              # deploy.sh exit semantics, v1.2.0, verified 2026-11-05 by
+              # reading a generated deploy.sh (house rule 2; its logic is
+              # identical to v1.1.2's, the only diff being the version
+              # banner and the input order of a namespace list that
+              # deploy.sh sorts):
+              #   0  every component installed; or, WITH --best-effort, some
+              #      failed: it prints "Deployment completed with failures
+              #      (--best-effort): <components>" and still exits 0.
+              #   1  without --best-effort: the first component failure.
+              #      Also --best-effort failures PLUS a deferred DRA restart:
+              #      "a hard component failure outranks the retry signal".
+              #   2  (new) helm installed every component, but deploy.sh
+              #      withheld the DRA kubelet-plugin restart because the GPU
+              #      operator's driver migration was not observable or did
+              #      not finish within its 15m wait; it prints a "retry
+              #      needed for: ..." line asking for a re-run. That block
+              #      renders only when the operator owns the driver: with
+              #      gpu-operator driver.enabled=false it is absent.
+              # The Job preserves deploy.sh's code on failure, with one
+              # exception (design 2026-10-22 §7.1): exit 2 under --best-effort
+              # whose log carries deploy.sh's own retry line and no failure
+              # report warns and continues to validation. Keying on that line,
+              # not on the code alone, keeps any other exit 2 fatal; the
+              # report line is still checked ourselves, so a partial install
+              # can never masquerade as success.
+              DEPLOY_VALUE_ARGS=( {{ include "nvidia-aicr.shellArgs" (dict "key" "deployArgs" "args" .Values.deployArgs) }})
+              DEPLOY_BEST_EFFORT=false
+              case " ${DEPLOY_FLAGS} " in
+                *" --best-effort "*) DEPLOY_BEST_EFFORT=true ;;
+              esac
+              for arg in "${DEPLOY_VALUE_ARGS[@]}"; do
+                [ "$arg" = "--best-effort" ] && DEPLOY_BEST_EFFORT=true
+              done
               rc=0
-              ( cd ./bundles && bash ./deploy.sh ${DEPLOY_FLAGS} ) 2>&1 | tee ./deploy.log || rc=$?
+              ( cd ./bundles && bash ./deploy.sh ${DEPLOY_FLAGS} "${DEPLOY_VALUE_ARGS[@]}" ) 2>&1 | tee ./deploy.log || rc=$?
+              if [ "${rc}" -eq 2 ] && [ "${DEPLOY_BEST_EFFORT}" = "true" ] \
+                 && grep -qF "DRA kubelet plugin restart blocked, retry needed for:" ./deploy.log \
+                 && ! grep -q "Deployment completed with failures" ./deploy.log; then
+                echo "WARN: deploy.sh deferred the DRA kubelet-plugin restart (exit 2): every component installed, but the GPU operator's driver migration had not settled, so the plugin was not restarted"
+                echo "  deploy.sh: $(grep -o 'retry needed for:.*' ./deploy.log | tail -1)"
+                echo "  To finish: once the operator has converged, re-run the install (helm upgrade creates a fresh Job, which re-runs deploy.sh)"
+                echo "--best-effort set: continuing past the deferred restart"
+                rc=0
+              fi
               if [ "${rc}" -ne 0 ]; then
                 # Preserve deploy.sh's exit code (like the validate/publish
                 # paths): the Job exit code is a documented status surface,
                 # and flattening to 1 would erase e.g. bash's 126/127 or any
                 # future distinct upstream code.
                 echo "=== AICR install FAILED (deploy.sh exit ${rc}) ==="
+                if [ "${rc}" -eq 2 ]; then
+                  echo "  (exit 2 continues only as a deferred DRA kubelet-plugin restart: --best-effort set, deploy.sh's retry line in the log, no component failures. Here one of those is missing, so this is either a deferred restart without --best-effort (re-run once the GPU operator has converged) or deploy.sh exited 2 for another reason; see the log above)"
+                fi
                 exit "${rc}"
               fi
               if grep -q "Deployment completed with failures" ./deploy.log; then
                 echo "WARN: deploy.sh reported component failures (see log above)"
-                case " ${DEPLOY_FLAGS} " in
-                  *" --best-effort "*) echo "--best-effort set: continuing past component failures" ;;
-                  *) echo "=== AICR install FAILED (component failures without --best-effort) ==="; exit 1 ;;
-                esac
+                if [ "${DEPLOY_BEST_EFFORT}" = "true" ]; then
+                  echo "--best-effort set: continuing past component failures"
+                else
+                  echo "=== AICR install FAILED (component failures without --best-effort) ==="; exit 1
+                fi
               fi
               echo "=== AICR install complete ==="
               fi
@@ -426,12 +489,13 @@ spec:
                   EVIDENCE_ARGS+=(--emit-attestation ./evidence)
                 fi
                 rc=0
-                # VALIDATE_FLAGS is intentionally word-split, like its recipe/
-                # bundle/deploy siblings: freeform passthrough for validate
-                # flags (--namespace, --image-pull-secret, --node-selector...).
+                # Legacy VALIDATE_FLAGS is intentionally word-split, like its
+                # recipe/bundle/deploy siblings. Structured arguments retain
+                # spaces, quoting and glob characters exactly.
+                VALIDATE_VALUE_ARGS=( {{ include "nvidia-aicr.shellArgs" (dict "key" "validateArgs" "args" .Values.validateArgs) }})
                 ./aicr validate --recipe ./recipe.yaml "${PHASE_ARGS[@]}" \
                   "${DATA_ARGS[@]}" "${EVIDENCE_ARGS[@]}" \
-                  --output ./ctrf.json ${VALIDATE_FLAGS} || rc=$?
+                  --output ./ctrf.json ${VALIDATE_FLAGS} "${VALIDATE_VALUE_ARGS[@]}" || rc=$?
                 echo "aicr validate exit=${rc}"
                 # Upstream exit-code semantics, so the log is self-explaining:
                 case "${rc}" in
